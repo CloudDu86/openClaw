@@ -401,7 +401,7 @@ export async function runAgentLoop(
   const MAX_IDLE_TURNS = 10; // Force sleep after N turns with no real work
   let idleTurnCount = 0;
 
-  const maxCycleTurns = config.maxTurnsPerCycle ?? 25;
+  const maxCycleTurns = config.maxTurnsPerCycle ?? 10;
   let cycleTurnCount = 0;
 
   let pendingInput: { content: string; source: string } | undefined = {
@@ -409,9 +409,29 @@ export async function runAgentLoop(
     source: "wakeup",
   };
 
+  // ── Rate Limit Throttle ──
+  // Tier 1 Anthropic: 30K input tokens/min. Enforce minimum 15s between turns
+  // to cap at ~4 turns/minute, keeping cumulative input under the limit.
+  let lastTurnEndMs = 0;
+  const MIN_TURN_INTERVAL_MS = 15_000;
+
+  // ── Dual-Tier Routing ──
+  // Default: Haiku (cheap). Escalate to Sonnet only when market data
+  // needs analysis (previous turn fetched prices/orderbook).
+  let needsSonnet = false;
+
   while (running) {
     // Declared outside try so the catch block can access for retry/failure handling
     let claimedMessages: InboxMessageRow[] = [];
+
+    // Enforce minimum interval between turns
+    if (lastTurnEndMs > 0) {
+      const elapsed = Date.now() - lastTurnEndMs;
+      if (elapsed < MIN_TURN_INTERVAL_MS) {
+        const waitMs = MIN_TURN_INTERVAL_MS - elapsed;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+    }
 
     try {
       // Check if we should be sleeping
@@ -599,14 +619,24 @@ export async function runAgentLoop(
       pendingInput = undefined;
 
       // ── Inference Call (via router when available) ──
+      // Dual-tier routing: default to Haiku (heartbeat_triage).
+      // Escalate to Sonnet (agent_turn) ONLY when previous turn fetched
+      // market data that needs analysis or when agent is writing trade code.
       const survivalTier = getSurvivalTier(financial.creditsCents);
-      log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
+      let taskType: import("../types.js").InferenceTaskType = "heartbeat_triage";
+
+      if (needsSonnet) {
+        taskType = "agent_turn";
+        needsSonnet = false; // reset after use
+      }
+
+      log(config, `[THINK] Routing inference (tier: ${survivalTier}, taskType: ${taskType})...`);
 
       const inferenceTools = toolsToInferenceFormat(tools);
       const routerResult = await inferenceRouter.route(
         {
           messages: messages,
-          taskType: "agent_turn",
+          taskType,
           tier: survivalTier,
           sessionId: db.getKV("session_id") || "default",
           turnId: ulid(),
@@ -685,6 +715,39 @@ export async function runAgentLoop(
 
           callCount++;
         }
+      }
+
+      // ── Dual-Tier Routing: Detect if next turn needs Sonnet ──
+      // Escalate to Sonnet ONLY when this turn fetched market data that
+      // requires quantitative analysis (prices, orderbooks, signals).
+      const marketDataIndicators = ["polymarket", "Prices", "orderbook", "conditionId", "OutcomePrices", "P_true", "signal_weights"];
+      const hasMarketData = turn.toolCalls.some((tc) =>
+        tc.name === "exec" && !tc.error && marketDataIndicators.some((ind) => tc.result.includes(ind))
+      );
+      const isWritingTradeCode = turn.toolCalls.some((tc) =>
+        (tc.name === "write_file" || tc.name === "edit_own_file") &&
+        tc.arguments && JSON.stringify(tc.arguments).includes("trade")
+      );
+      if (hasMarketData || isWritingTradeCode) {
+        needsSonnet = true;
+      }
+
+      // ── Market Data Caching ──
+      // Store market snapshot hash. If next scan returns same data, skip LLM analysis.
+      if (hasMarketData) {
+        const marketSnapshot = turn.toolCalls
+          .filter((tc) => tc.name === "exec" && !tc.error)
+          .map((tc) => tc.result)
+          .join("");
+        // Simple hash: first 200 chars of price data
+        const snapshotKey = marketSnapshot.replace(/\s+/g, "").slice(0, 200);
+        const lastSnapshot = db.getKV("market_snapshot_hash");
+        if (lastSnapshot === snapshotKey) {
+          // Market data unchanged — skip Sonnet analysis, stay on Haiku
+          needsSonnet = false;
+          log(config, "[CACHE] Market data unchanged since last scan, skipping deep analysis.");
+        }
+        db.setKV("market_snapshot_hash", snapshotKey);
       }
 
       // ── Persist Turn (atomic: turn + tool calls + inbox ack) ──
@@ -856,8 +919,8 @@ export async function runAgentLoop(
       if (!currentInput && !didMutate) {
         idleTurnCount++;
         if (idleTurnCount >= MAX_IDLE_TURNS) {
-          log(config, `[IDLE] ${idleTurnCount} consecutive idle turns with no work. Entering sleep.`);
-          db.setKV("sleep_until", new Date(Date.now() + 60_000).toISOString());
+          log(config, `[IDLE] ${idleTurnCount} idle turns. Sleeping 30 min.`);
+          db.setKV("sleep_until", new Date(Date.now() + 1_800_000).toISOString());
           db.setAgentState("sleeping");
           onStateChange?.("sleeping");
           running = false;
@@ -867,13 +930,12 @@ export async function runAgentLoop(
       }
 
       // ── Cycle turn limit ──
-      // Hard ceiling on turns per wake cycle, regardless of tool type.
-      // Prevents runaway loops where mutating tools (exec, write_file)
-      // defeat idle detection indefinitely.
+      // Hard ceiling on turns per wake cycle. After completing a cycle,
+      // sleep 30 min to conserve API budget (Tier 1: 30K input/min).
       cycleTurnCount++;
       if (running && cycleTurnCount >= maxCycleTurns) {
-        log(config, `[CYCLE LIMIT] ${cycleTurnCount} turns reached (max: ${maxCycleTurns}). Forcing sleep.`);
-        db.setKV("sleep_until", new Date(Date.now() + 120_000).toISOString());
+        log(config, `[CYCLE LIMIT] ${cycleTurnCount} turns. Sleeping 30 min.`);
+        db.setKV("sleep_until", new Date(Date.now() + 1_800_000).toISOString());
         db.setAgentState("sleeping");
         onStateChange?.("sleeping");
         running = false;
@@ -886,12 +948,12 @@ export async function runAgentLoop(
         (!response.toolCalls || response.toolCalls.length === 0) &&
         response.finishReason === "stop"
       ) {
-        // Agent produced text without tool calls.
-        // This is a natural pause point -- no work queued, sleep briefly.
-        log(config, "[IDLE] No pending inputs. Entering brief sleep.");
+        // Agent produced text without tool calls — natural pause.
+        // Sleep 30 min until next heartbeat-driven scan cycle.
+        log(config, "[IDLE] Scan complete. Sleeping 30 min.");
         db.setKV(
           "sleep_until",
-          new Date(Date.now() + 60_000).toISOString(),
+          new Date(Date.now() + 1_800_000).toISOString(),
         );
         db.setAgentState("sleeping");
         onStateChange?.("sleeping");
@@ -899,9 +961,12 @@ export async function runAgentLoop(
       }
 
       consecutiveErrors = 0;
+      lastTurnEndMs = Date.now();
     } catch (err: any) {
       consecutiveErrors++;
-      log(config, `[ERROR] Turn failed: ${err.message}`);
+      lastTurnEndMs = Date.now();
+      const errMsg = err.message || "";
+      log(config, `[ERROR] Turn failed: ${errMsg}`);
 
       // Handle inbox message state on turn failure:
       // Messages that have retries remaining go back to 'received';
@@ -918,6 +983,19 @@ export async function runAgentLoop(
           resetInboxToReceived(db.raw, retryable.map((m) => m.id));
           log(config, `[INBOX] ${retryable.length} message(s) reset to received for retry`);
         }
+      }
+
+      // ── Rate Limit Handling ──
+      // On 429 or circuit breaker errors, wait 60s for the per-minute
+      // quota to reset instead of burning through MAX_CONSECUTIVE_ERRORS.
+      const isRateLimit = errMsg.includes("429") || errMsg.includes("rate_limit") || errMsg.includes("Circuit breaker");
+      if (isRateLimit) {
+        log(config, `[RATE LIMIT] Waiting 60s for API quota reset...`);
+        await new Promise((resolve) => setTimeout(resolve, 60_000));
+        // Don't count rate limits toward fatal error threshold —
+        // they are transient and recoverable after waiting.
+        consecutiveErrors = Math.max(0, consecutiveErrors - 1);
+        continue;
       }
 
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {

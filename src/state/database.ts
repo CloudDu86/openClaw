@@ -82,11 +82,13 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 
+  // Open with no mmap — Docker named volumes on Windows/WSL2 can cause
+  // SQLITE_IOERR when mmap or WAL shared memory is used on overlay2/ext4.
   const db = new Database(dbPath);
-
-  // Enable WAL mode for better concurrent read performance
-  db.pragma("journal_mode = WAL");
-  db.pragma("wal_autocheckpoint = 1000");
+  db.pragma("journal_mode = DELETE");
+  db.pragma("mmap_size = 0");
+  db.pragma("synchronous = NORMAL");
+  db.pragma("locking_mode = EXCLUSIVE");
   db.pragma("foreign_keys = ON");
 
   // Integrity check on startup
@@ -512,6 +514,23 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
     return transaction();
   };
 
+  // ─── Conversation History Reset ─────────────────────────────
+
+  const clearConversationHistory = (): number => {
+    const clear = db.transaction(() => {
+      const toolCallsDel = db.prepare("DELETE FROM tool_calls").run();
+      const turnsDel = db.prepare("DELETE FROM turns").run();
+      // Clear transient memory that references old turns
+      try { db.prepare("DELETE FROM working_memory").run(); } catch { /* table may not exist */ }
+      try { db.prepare("DELETE FROM episodic_memory").run(); } catch { /* table may not exist */ }
+      try { db.prepare("DELETE FROM session_summaries").run(); } catch { /* table may not exist */ }
+      try { db.prepare("DELETE FROM wake_events").run(); } catch { /* table may not exist */ }
+      try { db.prepare("DELETE FROM event_stream").run(); } catch { /* table may not exist */ }
+      return turnsDel.changes + toolCallsDel.changes;
+    });
+    return clear();
+  };
+
   // ─── Close ───────────────────────────────────────────────────
 
   const close = (): void => {
@@ -559,6 +578,7 @@ export function createDatabase(dbPath: string): AutomatonDatabase {
     getAgentState,
     setAgentState,
     runTransaction,
+    clearConversationHistory,
     close,
     raw: db,
   };

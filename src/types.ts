@@ -694,6 +694,9 @@ export interface AutomatonDatabase {
   // Transaction helper
   runTransaction<T>(fn: () => T): T;
 
+  // History management
+  clearConversationHistory(): number;
+
   close(): void;
 
   // Raw better-sqlite3 instance for direct DB access (Phase 1.1)
@@ -868,11 +871,11 @@ export interface TokenBudget {
 }
 
 export const DEFAULT_TOKEN_BUDGET: TokenBudget = {
-  total: 100_000,
-  systemPrompt: 20_000,
-  recentTurns: 50_000,
-  toolResults: 20_000,
-  memoryRetrieval: 10_000,
+  total: 20_000,
+  systemPrompt: 2_000,
+  recentTurns: 10_000,
+  toolResults: 5_000,
+  memoryRetrieval: 3_000,
 };
 
 // ─── Phase 1: Runtime Reliability ───────────────────────────────

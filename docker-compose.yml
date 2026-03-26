@@ -1,0 +1,19 @@
+services:
+  automaton:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - automaton-data:/root/.automaton
+    command: ["node", "dist/index.js", "--run"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  automaton-data:

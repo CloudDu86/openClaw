@@ -34,7 +34,7 @@ import { DEFAULT_TREASURY_POLICY } from "./types.js";
 import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
 import { prettySink } from "./observability/pretty-sink.js";
 import { bootstrapTopup } from "./conway/topup.js";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import { keccak256, toHex } from "viem";
 
 const logger = createLogger("main");
@@ -205,6 +205,30 @@ async function run(): Promise<void> {
   // Initialize database
   const dbPath = resolvePath(config.dbPath);
   const db = createDatabase(dbPath);
+
+  // ── SOUL.md Hash Check — auto-reset history on SOUL change ──
+  {
+    const soulPath = path.join(getAutomatonDir(), "SOUL.md");
+    const forceReset = process.env.RESET_HISTORY_ON_START === "true";
+    let needsReset = forceReset;
+    let resetReason = forceReset ? "RESET_HISTORY_ON_START=true" : "";
+
+    if (!needsReset && fs.existsSync(soulPath)) {
+      const soulContent = fs.readFileSync(soulPath, "utf8");
+      const currentHash = createHash("sha256").update(soulContent).digest("hex");
+      const storedHash = db.getKV("soul_md_hash");
+      if (storedHash && storedHash !== currentHash) {
+        needsReset = true;
+        resetReason = `SOUL.md changed (${storedHash.slice(0, 8)}→${currentHash.slice(0, 8)})`;
+      }
+      db.setKV("soul_md_hash", currentHash);
+    }
+
+    if (needsReset) {
+      const cleared = db.clearConversationHistory();
+      logger.info(`[HISTORY RESET] ${resetReason} — cleared ${cleared} rows`);
+    }
+  }
 
   // Persist createdAt: only set if not already stored (never overwrite)
   const existingCreatedAt = db.getIdentity("createdAt");

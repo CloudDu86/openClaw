@@ -273,7 +273,14 @@ async function chatViaAnthropic(params: {
   };
 
   if (transformed.system) {
-    body.system = transformed.system;
+    // Use content block format with cache_control for prompt caching
+    body.system = [
+      {
+        type: "text",
+        text: transformed.system,
+        cache_control: { type: "ephemeral" },
+      },
+    ];
   }
 
   if (params.temperature !== undefined) {
@@ -295,6 +302,7 @@ async function chatViaAnthropic(params: {
       "Content-Type": "application/json",
       "x-api-key": params.anthropicApiKey,
       "anthropic-version": "2023-06-01",
+      "anthropic-beta": "prompt-caching-2024-07-31",
     },
     body: JSON.stringify(body),
     timeout: INFERENCE_TIMEOUT_MS,
@@ -366,8 +374,20 @@ function transformMessagesForAnthropic(
     }
 
     if (msg.role === "user") {
-      // Merge consecutive user messages
       const last = transformed[transformed.length - 1];
+      // If content is already an array (e.g. tool_result blocks from router),
+      // preserve it as-is — do not merge with string-content user messages.
+      if (Array.isArray(msg.content)) {
+        if (last && last.role === "user" && Array.isArray(last.content)) {
+          (last.content as Array<Record<string, unknown>>).push(
+            ...(msg.content as Array<Record<string, unknown>>),
+          );
+          continue;
+        }
+        transformed.push({ role: "user", content: msg.content });
+        continue;
+      }
+      // Merge consecutive string-content user messages
       if (last && last.role === "user" && typeof last.content === "string") {
         last.content = last.content + "\n" + msg.content;
         continue;
@@ -431,9 +451,31 @@ function transformMessagesForAnthropic(
     }
   }
 
+  // Anthropic requires at least one message, and it must start with 'user'.
+  if (transformed.length === 0 || transformed[0].role !== "user") {
+    transformed.unshift({ role: "user", content: "[system] Continue." });
+  }
+
+  // Anthropic requires strict user/assistant alternation.
+  // Insert synthetic messages to fix any violations.
+  const fixed: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < transformed.length; i++) {
+    const msg = transformed[i];
+    const prev = fixed[fixed.length - 1];
+    if (prev && prev.role === msg.role) {
+      // Same role consecutive — insert a bridge message
+      if (msg.role === "user") {
+        fixed.push({ role: "assistant", content: [{ type: "text", text: "Understood." }] });
+      } else {
+        fixed.push({ role: "user", content: "[system] Continue." });
+      }
+    }
+    fixed.push(msg);
+  }
+
   return {
     system: systemParts.length > 0 ? systemParts.join("\n\n") : undefined,
-    messages: transformed,
+    messages: fixed,
   };
 }
 

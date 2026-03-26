@@ -17,13 +17,14 @@ import type {
 import { DEFAULT_TOKEN_BUDGET } from "../types.js";
 import { createTokenCounter } from "../memory/context-manager.js";
 
-const MAX_CONTEXT_TURNS = 20;
-const SUMMARY_THRESHOLD = 15;
+const MAX_CONTEXT_TURNS = 5;
+const SUMMARY_THRESHOLD = 3;
 
 let tokenCounter: ReturnType<typeof createTokenCounter> | null = null;
 
-/** Maximum size for individual tool results in characters */
-export const MAX_TOOL_RESULT_SIZE = 10_000;
+/** Maximum size for individual tool results in characters.
+ * Aggressive limit to stay within Tier 1 rate limits (30K input tokens/min). */
+export const MAX_TOOL_RESULT_SIZE = 2_000;
 
 // Re-export for external use
 export type { TokenBudget };
@@ -59,6 +60,35 @@ export function truncateToolResult(result: string, maxSize: number = MAX_TOOL_RE
   if (result.length <= maxSize) return result;
   return result.slice(0, maxSize) +
     `\n\n[TRUNCATED: ${result.length - maxSize} characters omitted]`;
+}
+
+/**
+ * Truncate tool call arguments for context replay.
+ * Large payloads (write_file content, exec output) are replaced with summaries
+ * to prevent context bloat that triggers rate limits.
+ */
+function truncateToolArguments(toolName: string, args: Record<string, unknown>): string {
+  const raw = JSON.stringify(args);
+  // Small arguments pass through as-is
+  if (raw.length <= 500) return raw;
+
+  // For write_file/edit_own_file: replace content with a stub
+  if ((toolName === "write_file" || toolName === "edit_own_file") && typeof args.content === "string") {
+    const stub = { ...args, content: `[FILE CONTENT: ${(args.content as string).length} chars written to ${args.path || "file"}]` };
+    return JSON.stringify(stub);
+  }
+
+  // For exec: truncate long commands
+  if (toolName === "exec" && typeof args.command === "string" && (args.command as string).length > 500) {
+    const stub = { ...args, command: (args.command as string).slice(0, 200) + "..." };
+    return JSON.stringify(stub);
+  }
+
+  // Generic: truncate any argument string over 500 chars
+  if (raw.length > 1000) {
+    return raw.slice(0, 500) + `...[TRUNCATED ${raw.length - 500} chars]`;
+  }
+  return raw;
 }
 
 /**
@@ -170,14 +200,14 @@ export function buildContextMessages(
         content: turn.thinking,
       };
 
-      // If there were tool calls, include them
+      // If there were tool calls, include them (with argument truncation)
       if (turn.toolCalls.length > 0) {
         msg.tool_calls = turn.toolCalls.map((tc) => ({
           id: tc.id,
           type: "function" as const,
           function: {
             name: tc.name,
-            arguments: JSON.stringify(tc.arguments),
+            arguments: truncateToolArguments(tc.name, tc.arguments),
           },
         }));
       }

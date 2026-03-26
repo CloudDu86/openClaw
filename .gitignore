@@ -1,13 +1,38 @@
-node_modules
-dist
+# 🚨 绝对禁止上传的机密文件 🚨
 .env
-*.log
-.DS_Store
+wallet.json
+*api_key*.json
+polymarket_api_key.json
+
+# 🗄️ 数据库与缓存 (避免历史中毒和文件过大)
+.local/
+data/
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# 📈 交易日志与状态 (这是你的私人账本)
+trade_journal.json
+polymarket_positions.json
+signal_weights.json
+best_opportunity.json
+polymarket_watchlist.json
+
+# 📦 Node.js 依赖包
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# 🔧 构建产物与系统文件
+dist/
 *.tgz
+.DS_Store
+Thumbs.db
+
+# 🤖 运行时生成的 automaton 文件
 .automaton/wallet.json
 .automaton/state.db
-

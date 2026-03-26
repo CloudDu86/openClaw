@@ -132,6 +132,35 @@ export const STATIC_MODEL_BASELINE: Omit<ModelEntry, "lastSeen" | "createdAt" | 
     parameterStyle: "max_completion_tokens",
     enabled: true,
   },
+  // Anthropic models for direct API usage
+  {
+    modelId: "claude-sonnet-4-6",
+    provider: "anthropic",
+    displayName: "Claude Sonnet 4.6",
+    tierMinimum: "normal",
+    costPer1kInput: 30,    // $3.00/M
+    costPer1kOutput: 150,  // $15.00/M
+    maxTokens: 16384,
+    contextWindow: 200000,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_tokens",
+    enabled: true,
+  },
+  {
+    modelId: "claude-haiku-4-5",
+    provider: "anthropic",
+    displayName: "Claude Haiku 4.5",
+    tierMinimum: "low_compute",
+    costPer1kInput: 8,     // $0.80/M
+    costPer1kOutput: 40,   // $4.00/M
+    maxTokens: 8192,
+    contextWindow: 200000,
+    supportsTools: true,
+    supportsVision: true,
+    parameterStyle: "max_tokens",
+    enabled: true,
+  },
 ];
 
 // === Default Routing Matrix ===
@@ -139,30 +168,30 @@ export const STATIC_MODEL_BASELINE: Omit<ModelEntry, "lastSeen" | "createdAt" | 
 
 export const DEFAULT_ROUTING_MATRIX: RoutingMatrix = {
   high: {
-    agent_turn: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 8192, ceilingCents: -1 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    safety_check: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 4096, ceilingCents: 20 },
-    summarization: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 15 },
-    planning: { candidates: ["gpt-5.2", "gpt-5.3"], maxTokens: 8192, ceilingCents: -1 },
+    agent_turn: { candidates: ["claude-sonnet-4-6"], maxTokens: 4096, ceilingCents: 20 },
+    heartbeat_triage: { candidates: ["claude-haiku-4-5"], maxTokens: 1024, ceilingCents: 3 },
+    safety_check: { candidates: ["claude-haiku-4-5"], maxTokens: 2048, ceilingCents: 5 },
+    summarization: { candidates: ["claude-haiku-4-5"], maxTokens: 2048, ceilingCents: 5 },
+    planning: { candidates: ["claude-sonnet-4-6"], maxTokens: 4096, ceilingCents: 15 },
   },
   normal: {
-    agent_turn: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: -1 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    safety_check: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
-    summarization: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
-    planning: { candidates: ["gpt-5.2", "gpt-5-mini"], maxTokens: 4096, ceilingCents: -1 },
+    agent_turn: { candidates: ["claude-sonnet-4-6"], maxTokens: 4096, ceilingCents: 20 },
+    heartbeat_triage: { candidates: ["claude-haiku-4-5"], maxTokens: 1024, ceilingCents: 2 },
+    safety_check: { candidates: ["claude-haiku-4-5"], maxTokens: 1024, ceilingCents: 3 },
+    summarization: { candidates: ["claude-haiku-4-5"], maxTokens: 2048, ceilingCents: 5 },
+    planning: { candidates: ["claude-haiku-4-5"], maxTokens: 2048, ceilingCents: 5 },
   },
   low_compute: {
-    agent_turn: { candidates: ["gpt-5-mini"], maxTokens: 4096, ceilingCents: 10 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 1024, ceilingCents: 2 },
-    safety_check: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    summarization: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
-    planning: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 5 },
+    agent_turn: { candidates: ["claude-haiku-4-5"], maxTokens: 4096, ceilingCents: 10 },
+    heartbeat_triage: { candidates: ["claude-haiku-4-5"], maxTokens: 1024, ceilingCents: 2 },
+    safety_check: { candidates: ["claude-haiku-4-5"], maxTokens: 2048, ceilingCents: 5 },
+    summarization: { candidates: ["claude-haiku-4-5"], maxTokens: 2048, ceilingCents: 5 },
+    planning: { candidates: ["claude-haiku-4-5"], maxTokens: 2048, ceilingCents: 5 },
   },
   critical: {
-    agent_turn: { candidates: ["gpt-5-mini"], maxTokens: 2048, ceilingCents: 3 },
-    heartbeat_triage: { candidates: ["gpt-5-mini"], maxTokens: 512, ceilingCents: 1 },
-    safety_check: { candidates: ["gpt-5-mini"], maxTokens: 1024, ceilingCents: 2 },
+    agent_turn: { candidates: ["claude-haiku-4-5"], maxTokens: 2048, ceilingCents: 3 },
+    heartbeat_triage: { candidates: ["claude-haiku-4-5"], maxTokens: 512, ceilingCents: 1 },
+    safety_check: { candidates: ["claude-haiku-4-5"], maxTokens: 1024, ceilingCents: 2 },
     summarization: { candidates: [], maxTokens: 0, ceilingCents: 0 },
     planning: { candidates: [], maxTokens: 0, ceilingCents: 0 },
   },
@@ -178,9 +207,9 @@ export const DEFAULT_ROUTING_MATRIX: RoutingMatrix = {
 // === Default Model Strategy Config ===
 
 export const DEFAULT_MODEL_STRATEGY_CONFIG: ModelStrategyConfig = {
-  inferenceModel: "gpt-5.2",
-  lowComputeModel: "gpt-5-mini",
-  criticalModel: "gpt-5-mini",
+  inferenceModel: "claude-sonnet-4-6",
+  lowComputeModel: "claude-haiku-4-5",
+  criticalModel: "claude-haiku-4-5",
   maxTokensPerTurn: 4096,
   hourlyBudgetCents: 0,
   sessionBudgetCents: 0,

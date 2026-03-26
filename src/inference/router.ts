@@ -239,7 +239,12 @@ export class InferenceRouter {
     }
 
     if (provider === "anthropic") {
-      return this.fixAnthropicMessages(messages);
+      // Do NOT transform here for Anthropic. The raw ChatMessage[] (with
+      // role:"tool" messages intact) is passed straight to chatViaAnthropic(),
+      // which calls transformMessagesForAnthropic() to build proper
+      // tool_result content blocks. Transforming here would convert tool
+      // messages to plain-string user messages, losing tool_result structure.
+      return this.mergeConsecutiveSameRole(messages);
     }
 
     // For OpenAI/Conway, merge consecutive same-role messages
