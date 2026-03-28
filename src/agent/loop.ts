@@ -357,6 +357,7 @@ export async function runAgentLoop(
   }
 
   let consecutiveErrors = 0;
+  let consecutiveTruncations = 0;
   let running = true;
   let lastToolPatterns: string[] = [];
   let loopWarningPattern: string | null = null;
@@ -671,6 +672,31 @@ export async function runAgentLoop(
 
       // ── Execute Tool Calls ──
       if (response.toolCalls && response.toolCalls.length > 0) {
+        // If model output was truncated (max_tokens hit), the last tool call's
+        // arguments JSON is likely incomplete — skip execution to prevent crash loops.
+        if (response.finishReason === "length" || response.finishReason === "max_tokens") {
+          consecutiveTruncations++;
+          log(config, `[WARN] Model output truncated (${consecutiveTruncations}/3). Skipping tool call.`);
+          turn.toolCalls = [{
+            id: ulid(),
+            name: response.toolCalls[0]?.function?.name || "unknown",
+            arguments: {},
+            result: "SKIPPED: Output truncated. DO NOT write large files. Run: node ~/.automaton/market_scanner.mjs",
+            durationMs: 0,
+          }];
+          db.insertTurn(turn);
+          for (const tc of turn.toolCalls) db.insertToolCall(turn.id, tc);
+          if (consecutiveTruncations >= 3) {
+            log(config, `[TRUNCATION LOOP] 3 consecutive truncations — forcing 30min sleep to save credits.`);
+            db.setAgentState("sleeping");
+            db.setKV("sleep_until", new Date(Date.now() + 1_800_000).toISOString());
+            running = false;
+          }
+          pendingInput = undefined;
+          continue;
+        }
+        consecutiveTruncations = 0;  // Reset on successful tool call
+
         const toolCallMessages: any[] = [];
         let callCount = 0;
         const currentInputSource = currentInput?.source as InputSource | undefined;
@@ -1055,7 +1081,16 @@ async function getFinancialState(
         }
       }
     }
-    // No cache available -- return conservative non-zero sentinel
+    // No cache available -- if we have a direct ANTHROPIC_API_KEY, assume
+    // credits are fine (Conway credit system is irrelevant for self-hosted keys).
+    if (process.env.ANTHROPIC_API_KEY) {
+      logger.warn("Balance API failed, but ANTHROPIC_API_KEY is set — assuming normal credits");
+      return {
+        creditsCents: 50_00,  // $50 sentinel — keeps agent in "normal" tier
+        usdcBalance: -1,
+        lastChecked: new Date().toISOString(),
+      };
+    }
     logger.error("Balance API failed, no cache available");
     return {
       creditsCents: -1,

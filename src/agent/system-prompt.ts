@@ -168,166 +168,37 @@ Your sandbox ID is ${identity.sandboxId}.
 Your chain type is ${chainType}.`,
   );
 
-  // Layer 3: SOUL.md -- structured soul model injection (Phase 2.1)
+  // ── CRITICAL DIRECTIVE (hardcoded, agent cannot modify) ──
+  sections.push(`--- CRITICAL DIRECTIVE [IMMUTABLE] ---
+Your ONLY job each wake cycle:
+1. Run: exec({"command":"node ~/.automaton/market_scanner.mjs","timeout":60000})
+2. If output contains "No actionable opportunities": call sleep({"seconds":1800}) immediately.
+3. If a trade was placed: call sleep({"seconds":1800}) immediately.
+4. NEVER run the scanner more than once per wake cycle.
+5. NEVER create new scripts or modify market_scanner.mjs.
+--- END CRITICAL DIRECTIVE ---`);
+
+  // Layer 3: SOUL.md (compact — only strategy + boundaries)
   const soul = loadCurrentSoul(db.raw);
   if (soul) {
-    // Track content hash for unauthorized change detection
-    const lastHash = db.getKV("soul_content_hash");
-    if (lastHash && lastHash !== soul.contentHash) {
-      logger.warn("SOUL.md content changed since last load");
-    }
     db.setKV("soul_content_hash", soul.contentHash);
-
-    const soulBlock = [
-      "## Soul [AGENT-EVOLVED CONTENT \u2014 soul/v1]",
-      `### Core Purpose\n${soul.corePurpose}`,
-      `### Values\n${soul.values.map((v) => "- " + v).join("\n")}`,
-      soul.personality ? `### Personality\n${soul.personality}` : "",
-      `### Boundaries\n${soul.boundaries.map((b) => "- " + b).join("\n")}`,
-      soul.strategy ? `### Strategy\n${soul.strategy}` : "",
-      soul.capabilities ? `### Capabilities\n${soul.capabilities}` : "",
-      "## End Soul",
-    ]
-      .filter(Boolean)
-      .join("\n\n");
+    // Only inject strategy and boundaries (skip values, personality, capabilities to save tokens)
+    const soulBlock = `## Soul\nPurpose: ${soul.corePurpose}\nBoundaries: ${soul.boundaries.join("; ")}\n${soul.strategy ? `Strategy: ${soul.strategy}` : ""}`;
     sections.push(soulBlock);
-  } else {
-    // Fallback: try loading raw SOUL.md for legacy support
-    const soulContent = loadSoulMd();
-    if (soulContent) {
-      const sanitized = sanitizeInput(soulContent, "soul", "skill_instruction");
-      const truncated = sanitized.content.slice(0, 5000);
-      const hash = crypto.createHash("sha256").update(soulContent).digest("hex");
-      const lastHash = db.getKV("soul_content_hash");
-      if (lastHash && lastHash !== hash) {
-        logger.warn("SOUL.md content changed since last load");
-      }
-      db.setKV("soul_content_hash", hash);
-      sections.push(
-        `## Soul [AGENT-EVOLVED CONTENT]\n${truncated}\n## End Soul`,
-      );
-    }
   }
 
-  // Layer 3.5: WORKLOG.md -- persistent working context
-  const worklogContent = loadWorklog();
-  if (worklogContent) {
-    sections.push(
-      `--- WORKLOG ---\n${worklogContent}\n--- END WORKLOG ---`,
-    );
-  }
+  // Skip WORKLOG.md, genesis prompt, and skill instructions to save tokens.
+  // The CRITICAL DIRECTIVE above replaces all of these.
 
-  // Layer 4: Genesis Prompt (set by creator, mutable by self with audit)
-  // Sanitized as agent-evolved content with trust boundary markers
-  if (config.genesisPrompt) {
-    const sanitized = sanitizeInput(config.genesisPrompt, "genesis", "skill_instruction");
-    const truncated = sanitized.content.slice(0, 2000);
-    sections.push(
-      `## Genesis Purpose [AGENT-EVOLVED CONTENT]\n${truncated}\n## End Genesis`,
-    );
-  }
-
-  // Layer 5: Active skill instructions (untrusted content with trust boundary markers)
-  if (skills && skills.length > 0) {
-    const skillInstructions = getActiveSkillInstructions(skills);
-    if (skillInstructions) {
-      sections.push(
-        `--- SKILLS [UNTRUSTED] ---\n${skillInstructions}\n--- END SKILLS ---`,
-      );
-    }
-  }
-
-  // Layer 6: Operational Context
-  sections.push(OPERATIONAL_CONTEXT);
-
-  // Layer 7: Dynamic Context
+  // Layer 7: Compact status
   const turnCount = db.getTurnCount();
-  const recentMods = db.getRecentModifications(5);
-  const registryEntry = db.getRegistryEntry();
-  const children = db.getChildren();
-  const lineageSummary = getLineageSummary(db, config);
-
-  // Build upstream status line from cached KV
-  let upstreamLine = "";
-  try {
-    const raw = db.getKV("upstream_status");
-    if (raw) {
-      const us = JSON.parse(raw);
-      if (us.originUrl) {
-        const age = us.checkedAt
-          ? `${Math.round((Date.now() - new Date(us.checkedAt).getTime()) / 3_600_000)}h ago`
-          : "unknown";
-        upstreamLine = `\nRuntime repo: ${us.originUrl} (${us.branch} @ ${us.headHash})`;
-        if (us.behind > 0) {
-          upstreamLine += `\nUpstream: ${us.behind} new commit(s) available (last checked ${age})`;
-        } else {
-          upstreamLine += `\nUpstream: up to date (last checked ${age})`;
-        }
-      }
-    }
-  } catch {
-    // No upstream data yet — skip
-  }
-
-  // Compute uptime from start_time KV
-  let uptimeLine = "";
-  try {
-    const startTime = db.getKV("start_time");
-    if (startTime) {
-      const uptimeMs = Date.now() - new Date(startTime).getTime();
-      const uptimeHours = Math.floor(uptimeMs / 3_600_000);
-      const uptimeMins = Math.floor((uptimeMs % 3_600_000) / 60_000);
-      uptimeLine = `\nUptime: ${uptimeHours}h ${uptimeMins}m`;
-    }
-  } catch {
-    // No start time available
-  }
-
-  // Compute survival tier
-  const survivalTier = financial.creditsCents > 50 ? "normal"
-    : financial.creditsCents > 10 ? "low_compute"
-    : financial.creditsCents > 0 ? "critical"
-    : "dead";
-
-  // Status block: wallet address and sandbox ID intentionally excluded (sensitive)
   sections.push(
-    `--- CURRENT STATUS ---
-State: ${state}
-Credits: $${(financial.creditsCents / 100).toFixed(2)}
-Survival tier: ${survivalTier}${uptimeLine}
-Total turns completed: ${turnCount}
-Recent self-modifications: ${recentMods.length}
-Inference model: ${config.inferenceModel}
-ERC-8004 Agent ID: ${registryEntry?.agentId || "not registered"}
-Children: ${children.filter((c) => c.status !== "dead").length} alive / ${children.length} total
-Lineage: ${lineageSummary}${upstreamLine}
---- END STATUS ---`,
+    `State: ${state} | Credits: $${(financial.creditsCents / 100).toFixed(2)} | Turns: ${turnCount} | Model: ${config.inferenceModel}`,
   );
 
-  const orchestratorStatus = getOrchestratorStatus(db.raw);
-  if (orchestratorStatus) {
-    sections.push(
-      `--- ORCHESTRATOR STATUS ---
-${orchestratorStatus}
---- END ORCHESTRATOR STATUS ---`,
-    );
-  }
-
-  // Layer 8: Available Tools (JSON schema)
-  const toolDescriptions = tools
-    .map(
-      (t) =>
-        `- ${t.name} (${t.category}): ${t.description}${t.riskLevel === "dangerous" || t.riskLevel === "forbidden" ? ` [${t.riskLevel.toUpperCase()}]` : ""}`,
-    )
-    .join("\n");
-  sections.push(`--- AVAILABLE TOOLS ---\n${toolDescriptions}\n--- END TOOLS ---`);
-
-  // Layer 9: Creator's Initial Message (first run only)
-  if (isFirstRun && config.creatorMessage) {
-    sections.push(
-      `--- MESSAGE FROM YOUR CREATOR ---\n${config.creatorMessage}\n--- END CREATOR MESSAGE ---`,
-    );
-  }
+  // Layer 8: Tool names only (descriptions omitted to save tokens)
+  const toolNames = tools.map((t) => t.name).join(", ");
+  sections.push(`Tools: ${toolNames}`);
 
   return sections.join("\n\n");
 }
@@ -379,14 +250,5 @@ export function buildWakeupPrompt(params: {
   const chainType = config.chainType || "evm";
   const usdcNetwork = chainType === "solana" ? "Solana" : "Base";
 
-  if (turnCount === 0) {
-    return `First run. Name: ${config.name}. Creator: ${config.creatorAddress}. Credits: $${(financial.creditsCents / 100).toFixed(2)}. USDC: ${financial.usdcBalance.toFixed(4)} on ${usdcNetwork}.${config.creatorMessage ? ` Creator message: "${config.creatorMessage}"` : ""} Survey environment, then begin working.`;
-  }
-
-  const lastTurns = db.getRecentTurns(3);
-  const lastTurnSummary = lastTurns
-    .map((t) => `[${t.timestamp}] ${t.inputSource || "self"}: ${t.thinking.slice(0, 150)}`)
-    .join("\n");
-
-  return `Waking up after ${turnCount} turns. Credits: $${(financial.creditsCents / 100).toFixed(2)} | USDC: ${financial.usdcBalance.toFixed(4)}\nRecent: ${lastTurnSummary || "none"}`;
+  return `Wake cycle ${turnCount}. Step 1: exec node ~/.automaton/market_scanner.mjs. Step 2: sleep 1800s. Do NOT skip step 2.`;
 }

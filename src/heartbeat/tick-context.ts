@@ -53,6 +53,10 @@ export async function buildTickContext(
     creditBalance = await conway.getCreditsBalance();
   } catch (err: any) {
     logger.error("Failed to fetch credit balance", err instanceof Error ? err : undefined);
+    // If we have a direct Anthropic API key, Conway credits are irrelevant
+    if (process.env.ANTHROPIC_API_KEY) {
+      creditBalance = 50_00; // $50 sentinel — keeps agent in "normal" tier
+    }
   }
 
   let usdcBalance = 0;

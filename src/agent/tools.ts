@@ -91,6 +91,9 @@ const FORBIDDEN_COMMAND_PATTERNS = [
   /cat\s+.*wallet\.json/,
 ];
 
+// Script file extensions that should only be created via write_file (not exec heredoc)
+const SCRIPT_CREATE_PATTERN = /(?:cat|tee)\s*>\s*[^\s]*\.(?:mjs|js|ts|sh|py)\s*<</i;
+
 function isForbiddenCommand(command: string, sandboxId: string): string | null {
   for (const pattern of FORBIDDEN_COMMAND_PATTERNS) {
     if (pattern.test(command)) {
@@ -101,6 +104,11 @@ function isForbiddenCommand(command: string, sandboxId: string): string | null {
   // Block deleting own sandbox
   if (command.includes("sandbox_delete") && command.includes(sandboxId)) {
     return "Blocked: Cannot delete own sandbox";
+  }
+
+  // Block creating script files via exec heredoc — use write_file or run existing scripts
+  if (SCRIPT_CREATE_PATTERN.test(command)) {
+    return "Blocked: Do not create new script files. The trading system is already built at ~/.automaton/market_scanner.mjs. Run it with: node ~/.automaton/market_scanner.mjs";
   }
 
   return null;
@@ -158,15 +166,27 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       },
       execute: async (args, ctx) => {
         const filePath = args.path as string;
+        const content = args.content as string | undefined;
+        // Guard: content missing means model output was truncated (max_tokens hit)
+        if (content === undefined || content === null) {
+          return "ERROR: write_file requires a 'content' parameter. Your output was likely truncated. DO NOT write new scripts. Run: node ~/.automaton/market_scanner.mjs";
+        }
         // Path confinement: restrict writes to sandbox home directory
         const confined = confinePathToSandbox(filePath);
         if (typeof confined === "object") return confined.error;
+        // Block creation of new script files — the trading system is already built
+        const ext = confined.match(/\.([a-z]+)$/i)?.[1] || "";
+        const scriptExts = ["mjs", "js", "ts", "sh", "py"];
+        const allowedScripts = ["/root/.automaton/market_scanner.mjs"];
+        if (scriptExts.includes(ext) && !allowedScripts.includes(confined)) {
+          return "Blocked: Do not create new script files. The trading system is complete at ~/.automaton/market_scanner.mjs. Run it with: node ~/.automaton/market_scanner.mjs";
+        }
         // Guard against overwriting protected files (same check as edit_own_file)
         const { isProtectedFile } = await import("../self-mod/code.js");
         if (isProtectedFile(confined)) {
           return "Blocked: Cannot overwrite protected file. This is a hard-coded safety invariant.";
         }
-        await ctx.conway.writeFile(confined, args.content as string);
+        await ctx.conway.writeFile(confined, content);
         return `File written: ${confined}`;
       },
     },
@@ -254,23 +274,55 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
-        const balance = await ctx.conway.getCreditsBalance();
-        return `Credit balance: $${(balance / 100).toFixed(2)} (${balance} cents)`;
+        try {
+          const balance = await ctx.conway.getCreditsBalance();
+          return `Credit balance: $${(balance / 100).toFixed(2)} (${balance} cents)`;
+        } catch {
+          if (process.env.ANTHROPIC_API_KEY) {
+            return `Credit balance: OK (using direct Anthropic API key — Conway credit system bypassed)`;
+          }
+          return `ERROR: Could not fetch credit balance (Conway API unreachable)`;
+        }
       },
     },
     {
       name: "check_usdc_balance",
-      description: "Check your on-chain USDC balance.",
+      description: "Check your on-chain USDC balance on Polygon (USDC.e + native USDC).",
       category: "conway",
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
-        const { getUsdcBalance } = await import("../conway/x402.js");
-        const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
-        const network = chainType === "solana" ? "solana:mainnet" : "eip155:8453";
-        const balance = await getUsdcBalance(ctx.identity.address, network, chainType);
-        const networkLabel = chainType === "solana" ? "Solana" : "Base";
-        return `USDC balance: ${balance.toFixed(6)} USDC on ${networkLabel}`;
+        // Read Polygon USDC balances via RPC (same logic as market_scanner.mjs)
+        const address = ctx.identity.address;
+        const POLYGON_RPCS = [
+          "https://polygon-bor-rpc.publicnode.com",
+          "https://1rpc.io/matic",
+          "https://polygon.drpc.org",
+        ];
+        const USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+        const USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
+
+        async function readBalance(token: string): Promise<number> {
+          const padded = address.slice(2).toLowerCase().padStart(64, "0");
+          const data = "0x70a08231" + padded;
+          for (const rpc of POLYGON_RPCS) {
+            try {
+              const resp = await fetch(rpc, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: token, data }, "latest"] }),
+                signal: AbortSignal.timeout(8000),
+              });
+              const json = await resp.json() as any;
+              if (json?.result) return parseInt(json.result, 16) / 1e6;
+            } catch { /* try next RPC */ }
+          }
+          return 0;
+        }
+
+        const [usdcE, usdcNative] = await Promise.all([readBalance(USDC_E), readBalance(USDC_NATIVE)]);
+        const total = usdcE + usdcNative;
+        return `USDC on Polygon: $${total.toFixed(2)} total (USDC.e: ${usdcE.toFixed(4)}, Native USDC: ${usdcNative.toFixed(4)})`;
       },
     },
     {
