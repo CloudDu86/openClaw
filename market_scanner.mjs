@@ -17,7 +17,7 @@ import { readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 
 const HOME = homedir();
-const DATA = `${HOME}/.automaton`;
+const DATA = `${HOME}/.openclaw`;
 const req = createRequire(import.meta.url);
 
 // Use CJS build of viem (avoids ESM resolution issues in Conway sandbox)
@@ -29,6 +29,19 @@ function load(file, fallback) {
 }
 function save(file, obj) { writeFileSync(`${DATA}/${file}`, JSON.stringify(obj, null, 2)); }
 function log(...a) { console.log(new Date().toISOString(), ...a); }
+
+// Server酱微信推送
+const SERVERCHAN_KEY = "SCT330458TSdLCgJFxCpmcf89XX89WDuAM";
+async function notify(title, desp) {
+  try {
+    await fetch(`https://sctapi.ftqq.com/${SERVERCHAN_KEY}.send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.slice(0, 32), desp }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (e) { log("[NOTIFY ERR] " + e.message); }
+}
 
 async function fetchJson(url, opts = {}) {
   try {
@@ -145,7 +158,7 @@ async function getCurrentPrice(tokenId) {
 async function bootstrapPositions(walletAddr) {
   const journal = load("trade_journal.json", { trades: [] });
   // Fetch all markets to resolve conditionId → tokenId
-  const mktsResp = await fetchJson("https://clob.polymarket.com/sampling-markets?next_cursor=MQ==&limit=100");
+  const mktsResp = await fetchJson("https://clob.polymarket.com/sampling-markets?next_cursor=MQ==&limit=200");
   const mkts = mktsResp?.data || [];
   const conditionToTokens = {};
   for (const m of mkts) {
@@ -328,6 +341,12 @@ async function executeSell(position, decision, apiCreds, walletData) {
     error: orderResult.error || null,
   });
   save("trade_journal.json", journal);
+  const pnlStr = (pnlPct * 100).toFixed(1);
+  if (orderResult.success) {
+    await notify("SELL " + position.market?.slice(0, 20), `**${position.market}**\n\n- 方向: ${side} → 平仓\n- 入场价: $${position.entryPrice}\n- 卖出价: $${sellPrice.toFixed(2)}\n- 数量: ${sellTokens} tokens\n- PnL: ${pnlStr}%\n- 原因: ${reason}\n- netEdge: ${netEdge.toFixed(4)}`);
+  } else {
+    await notify("SELL FAILED", `**${position.market}**\n\n- 卖出失败: ${orderResult.error}\n- PnL: ${pnlStr}%`);
+  }
   return orderResult;
 }
 
@@ -338,7 +357,7 @@ async function executeSell(position, decision, apiCreds, walletData) {
 async function scanMarkets() {
   // Use CLOB sampling-markets endpoint (Gamma API blocked by GFW)
   const resp = await fetchJson(
-    "https://clob.polymarket.com/sampling-markets?next_cursor=MQ==&limit=100"
+    "https://clob.polymarket.com/sampling-markets?next_cursor=MQ==&limit=200"
   );
   const markets = resp?.data;
   if (!markets || markets.length === 0) { log("WARN: CLOB markets API unreachable"); return []; }
@@ -370,7 +389,7 @@ async function scanMarkets() {
       tags: mkt.tags || [],
     });
   }
-  return out.slice(0, 20);
+  return out.slice(0, 100);
 }
 
 // ── Signal 1: CLOB Microstructure ────────────────────────────────────────────
@@ -591,7 +610,7 @@ async function placeOrder(apiCreds, account, tokenId, side, price, sizeUsdc, neg
   const numTokens = Math.max(5, Math.floor(sizeUsdc / tickPrice));
   
   try {
-    const cmd = "python3 /root/.automaton/place_order.py " + JSON.stringify(tokenId) + " " + side + " " + tickPrice + " " + numTokens;
+    const cmd = "python3 /root/.openclaw/place_order.py " + JSON.stringify(tokenId) + " " + side + " " + tickPrice + " " + numTokens;
     log("  [ORDER CMD] " + cmd.slice(0, 200));
     const result = execSync(cmd, { timeout: 30000, encoding: "utf8" });
     const parsed = JSON.parse(result.trim());
@@ -903,6 +922,7 @@ async function main() {
           });
           save("polymarket_positions.json", pos);
           log("  [POSITION RECORDED] " + bestOpp.side + " " + bestOpp.question.slice(0, 40));
+          await notify("BUY " + bestOpp.side, `**${bestOpp.question}**\n\n- 方向: ${bestOpp.side}\n- 价格: $${bestOpp.tradePrice.toFixed(4)}\n- 数量: ${numTokens} tokens\n- 金额: $${bestOpp.size.toFixed(2)}\n- Edge: ${(bestOpp.edge * 100).toFixed(2)}%\n- OrderID: ${orderResult.orderID}`);
         }
       } catch (e) {
         log("  [EXEC ERROR] " + e.message);

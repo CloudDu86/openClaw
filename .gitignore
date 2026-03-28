@@ -17,6 +17,7 @@ data/
 
 # 📈 交易日志与状态 (这是你的私人账本)
 trade_journal.json
+my_journal.json
 polymarket_positions.json
 signal_weights.json
 best_opportunity.json

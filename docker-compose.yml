@@ -1,19 +1,37 @@
 services:
-  automaton:
-    build: .
-    restart: always
+  scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openclaw-scanner
+    restart: unless-stopped
+
+    # ── Load .env (ANTHROPIC_API_KEY etc.) ──
     env_file:
       - .env
-    volumes:
-      - automaton-data:/root/.automaton
-    command: ["node", "dist/index.js", "--run"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
 
-volumes:
-  automaton-data:
+    # ── Proxy: point to Windows host proxy via host.docker.internal ──
+    # !! 重要: 你的代理软件(Clash/V2Ray)必须监听 0.0.0.0:7890 而非仅 127.0.0.1 !!
+    # 如果你的代理端口不是 7890，请修改下面的值
+    # environment:
+      # - HTTP_PROXY=http://host.docker.internal:7890
+      # - HTTPS_PROXY=http://host.docker.internal:7890
+      # - NO_PROXY=localhost,127.0.0.1
+
+    # ── 确保 host.docker.internal 可解析 ──
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # ── Volume 挂载 ──
+    volumes:
+      # 数据目录: 钱包、API Key、交易日志、place_order.py
+      - ./data:/root/.openclaw
+      # 扫描器脚本 (只读挂载，方便宿主机编辑后即时生效)
+      - ./market_scanner.mjs:/app/market_scanner.mjs:ro
+
+    # ── 日志限制 ──
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

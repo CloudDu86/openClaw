@@ -1,0 +1,4 @@
+## OpenClaw Market Scanner - every 10 minutes
+## flock -n prevents concurrent runs; source /etc/environment for proxy + API key
+*/3 * * * * root flock -n /tmp/scanner.lock bash -c '. /etc/environment; cd /app && /usr/local/bin/node market_scanner.mjs >> /var/log/scanner.log 2>&1'
+
