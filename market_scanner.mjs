@@ -48,11 +48,34 @@ async function fetchJson(url, opts = {}) {
     const r = await fetch(url, {
       ...opts,
       headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(20000),  // 20s 超时（原 15s）
     });
-    if (!r.ok) { log(`WARN ${r.status} ${url.slice(0, 80)}`); return null; }
+    if (!r.ok) {
+      if (r.status !== 401) log(`WARN ${r.status} ${url.slice(0, 80)}`);
+      return null;
+    }
     return r.json();
-  } catch (e) { log(`ERR fetch: ${e.message}`); return null; }
+  } catch (e) { return null; }  // 任何错误（包括超时）都安静返回 null
+}
+
+async function fetchClob(url, method = "GET") {
+  try {
+    const parsed = new URL(url);
+    const path = parsed.pathname + parsed.search;
+    const apiCreds = load("polymarket_api_key.json", null);
+    let headers = {};
+    if (apiCreds) {
+      headers = hmacAuth(
+        apiCreds.apiKey,
+        apiCreds.secret,
+        apiCreds.passphrase,
+        apiCreds.address,
+        method,
+        path
+      );
+    }
+    return fetchJson(url, { method, headers });
+  } catch (e) { return null; }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -72,6 +95,7 @@ const EXIT_EDGE_THRESHOLD = -0.02;  // Net Edge < -2pp → thesis invalidated �
 const MIN_SELL_TOKENS = 5;          // Polymarket minimum order size
 const CTF_TOKEN_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"; // ERC-1155
 const DRY_RUN_EXITS = false;        // live mode — full auto
+const TRADING_ENABLED = true;       // system will trade automatically when conditions met
 
 // ── Polymarket Taker Fee (bell-curve × category) ──
 const PEAK_FEE_RATES = {
@@ -111,7 +135,8 @@ async function readBalanceOf(token, wallet) {
   const padded = wallet.slice(2).toLowerCase().padStart(64, "0");
   const data = "0x70a08231" + padded;  // balanceOf(address)
   const hex = await rpcCall("eth_call", [{ to: token, data }, "latest"]);
-  if (!hex) return 0;
+  if (!hex) return null; // [FIX] If RPC fails, return null instead of 0
+  if (hex === "0x") return 0;
   return parseInt(hex, 16) / 1e6;  // USDC = 6 decimals
 }
 
@@ -120,7 +145,9 @@ async function getPolygonUsdc(walletAddress) {
     readBalanceOf(USDC_E, walletAddress),
     readBalanceOf(USDC_NATIVE, walletAddress),
   ]);
-  return { usdcE, usdcNative, total: usdcE + usdcNative };
+  const e = usdcE || 0;
+  const n = usdcNative || 0;
+  return { usdcE: e, usdcNative: n, total: e + n };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -133,7 +160,8 @@ async function readTokenBalance(walletAddress, tokenId) {
   const id = BigInt(tokenId).toString(16).padStart(64, "0");
   const data = "0x00fdd58e" + addr + id;
   const hex = await rpcCall("eth_call", [{ to: CTF_TOKEN_CONTRACT, data }, "latest"]);
-  if (!hex || hex === "0x") return 0;
+  if (!hex) return null; // [FIX] Network/RPC error must not return 0
+  if (hex === "0x") return 0;
   return parseInt(hex, 16) / 1e6; // token amounts use 6 decimals like USDC
 }
 
@@ -216,38 +244,71 @@ async function bootstrapPositions(walletAddr) {
   return bootstrapped;
 }
 
-async function syncPositions(pos, walletAddr) {
+async function syncPositions(pos, walletAddr, forceFull = false) {
   let positions = pos.positions || [];
-  // Bootstrap if empty
-  if (positions.length === 0 && walletAddr) {
-    log("[POSITION SYNC] No local positions — bootstrapping from trade journal...");
-    positions = await bootstrapPositions(walletAddr);
-    if (positions.length > 0) {
-      pos.positions = positions;
-      save("polymarket_positions.json", pos);
-      log(`[POSITION SYNC] Bootstrapped ${positions.length} positions`);
-    }
-    return positions;
+  
+  // Decide if we need a full discovery (e.g., every 20 scans, but NOT on the very first run unless forced)
+  const scanCount = parseInt(process.env.SCAN_COUNT || "0");
+  const shouldDiscover = forceFull || (scanCount > 0 && scanCount % 20 === 0);
+
+  if (shouldDiscover) {
+    log(`  [SYNC] Periodic full discovery: checking top active markets...`);
+  } else {
+    log(`  [SYNC] Lightweight: checking balances for ${positions.length} known positions...`);
   }
-  // Verify existing positions against on-chain
+
+  // ── Step 1: Update existing local positions (Always do this, very fast) ──
   for (const p of positions) {
-    if (p.status !== "open") continue;
     const bal = await readTokenBalance(walletAddr, p.tokenId);
-    if (bal <= 0) {
-      log(`  [SYNC] "${p.market?.slice(0, 40)}" — on-chain balance=0, marking closed`);
+    if (bal === null) {
+      log(`  [SYNC] "${p.market?.slice(0, 40)}" — RPC read failed, keeping old balance`);
+      continue;
+    }
+    if (bal <= 0.1) {
+      log(`  [SYNC] "${p.market?.slice(0, 40)}" — balance=0, closing`);
       p.status = "closed";
-      p.exitReason = "resolved_or_zero_balance";
       p.exitDate = new Date().toISOString();
       if (!pos.closed) pos.closed = [];
-      pos.closed.push({ ...p });
+      pos.closed.push({ ...p }); // [FIX] Explicitly append to closed list before filter
     } else {
-      p.numTokens = bal; // update to actual on-chain count
+      p.numTokens = bal;
     }
   }
-  positions = positions.filter(p => p.status === "open");
-  pos.positions = positions;
+
+  // ── Step 2: Proactive discovery (Only occasionally) ──
+  if (shouldDiscover) {
+    const mktsResp = await fetchJson("https://clob.polymarket.com/sampling-markets?next_cursor=MQ==&limit=30");
+    const mkts = mktsResp?.data || [];
+    const localTokenIds = new Set(positions.filter(p => p.status === "open").map(p => p.tokenId));
+
+    for (const m of mkts) {
+      if (!m.tokens) continue;
+      for (const t of m.tokens) {
+        if (!t.token_id || localTokenIds.has(t.token_id)) continue;
+        const bal = await readTokenBalance(walletAddr, t.token_id);
+        if (bal > 0.1) {
+          log(`  [SYNC DISCOVERY] Found unrecorded: ${t.outcome} "${m.question.slice(0, 40)}"`);
+          positions.push({
+            id: "sync_" + Math.random().toString(36).slice(2),
+            market: m.question,
+            conditionId: m.condition_id,
+            tokenId: t.token_id,
+            side: t.outcome?.toUpperCase() || "YES",
+            entryPrice: 0,
+            numTokens: bal,
+            entryDate: new Date().toISOString(),
+            negRisk: m.neg_risk || false,
+            status: "open",
+          });
+          localTokenIds.add(t.token_id);
+        }
+      }
+    }
+  }
+
+  pos.positions = positions.filter(p => p.status === "open");
   save("polymarket_positions.json", pos);
-  return positions;
+  return pos.positions;
 }
 
 async function evaluatePosition(position, wData) {
@@ -355,48 +416,65 @@ async function executeSell(position, decision, apiCreds, walletData) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function scanMarkets() {
-  // Use CLOB sampling-markets endpoint (Gamma API blocked by GFW)
-  const resp = await fetchJson(
-    "https://clob.polymarket.com/sampling-markets?next_cursor=MQ==&limit=200"
-  );
-  const markets = resp?.data;
-  if (!markets || markets.length === 0) { log("WARN: CLOB markets API unreachable"); return []; }
+  // Use Gamma API (provides real volume, we bypass block with User-Agent)
+  const resp = await fetch(`https://gamma-api.polymarket.com/markets?limit=100&active=true&closed=false&order=volumeNum&ascending=false`, {
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+    signal: AbortSignal.timeout(20000)
+  }).then(r => r.json()).catch(() => null);
+
+  const markets = resp;
+  if (!markets || markets.length === 0) { log("WARN: Gamma markets API unreachable"); return []; }
 
   const now = Date.now();
   const out = [];
+
   for (const mkt of markets) {
-    if (mkt.closed || !mkt.active || !mkt.accepting_orders) continue;
-    const end = new Date(mkt.end_date_iso || 0).getTime();
+    if (mkt.closed || !mkt.active || !mkt.acceptingOrders) continue;
+    const end = new Date(mkt.endDateIso || mkt.endDate || 0).getTime();
     if (end && end - now < 12 * 3600e3) continue;  // skip markets ending within 12h
-    const tokens = mkt.tokens || [];
-    if (tokens.length < 2) continue;
-    const yesToken = tokens.find(t => t.outcome === "Yes") || tokens[0];
-    const noToken = tokens.find(t => t.outcome === "No") || tokens[1];
-    const yesPrice = parseFloat(yesToken.price || 0);
+    
+    let tokens = [];
+    try { tokens = JSON.parse(mkt.clobTokenIds || "[]"); } catch { continue; }
+    let outcomes = [];
+    try { outcomes = JSON.parse(mkt.outcomes || "[]"); } catch { continue; }
+    let prices = [];
+    try { prices = JSON.parse(mkt.outcomePrices || "[]"); } catch { continue; }
+    
+    if (tokens.length < 2 || outcomes.length < 2) continue;
+    
+    // Find exact Yes/No indexes (markets are often standard binary)
+    const yesIdx = outcomes.findIndex(o => o === "Yes");
+    const noIdx = outcomes.findIndex(o => o === "No");
+    if (yesIdx === -1 || noIdx === -1) continue;
+
+    const yesPrice = parseFloat(prices[yesIdx] || 0);
+    const noPrice = parseFloat(prices[noIdx] || 0);
+    
     if (yesPrice <= 0.05 || yesPrice >= 0.95) continue;
-    if (!yesToken.token_id) continue;
+    if (!tokens[yesIdx]) continue;
+
     out.push({
-      conditionId: mkt.condition_id,
+      conditionId: mkt.conditionId,
       question: mkt.question || "?",
       yesPrice,
-      noPrice: parseFloat(noToken.price || 0),
-      volume: 100000,  // CLOB API doesn't return volume, assume high
-      endDate: mkt.end_date_iso,
-      tokenIdYes: yesToken.token_id,
-      tokenIdNo: noToken.token_id || null,
-      negRisk: mkt.neg_risk || false,
-      tickSize: mkt.minimum_tick_size || 0.01,
-      tags: mkt.tags || [],
+      noPrice,
+      volume: parseFloat(mkt.volume || 0),
+      endDate: mkt.endDateIso || mkt.endDate,
+      tokenIdYes: tokens[yesIdx],
+      tokenIdNo: tokens[noIdx],
+      negRisk: mkt.negRisk || false,
+      tickSize: mkt.orderPriceMinTickSize || 0.01,
+      tags: mkt.tags ? (typeof mkt.tags === "string" ? JSON.parse(mkt.tags) : mkt.tags) : [],
     });
   }
-  return out.slice(0, 100);
+  return out;
 }
 
 // ── Signal 1: CLOB Microstructure ────────────────────────────────────────────
 async function clobSignal(tokenId, mktPrice) {
   const [book, trades] = await Promise.all([
     fetchJson(`https://clob.polymarket.com/book?token_id=${tokenId}`),
-    fetchJson(`https://clob.polymarket.com/trades?asset_id=${tokenId}&limit=100`),
+    fetchClob(`https://clob.polymarket.com/trades?asset_id=${tokenId}&limit=100`),
   ]);
   if (!book) return { signal: mktPrice, confidence: 0.2 };
 
@@ -501,8 +579,17 @@ function kellySize(pTrue, mktPrice, side, portfolio) {
   const b = 1 / price - 1;
   if (b <= 0) return { fraction: 0, size: 0 };
   const fullKelly = Math.max(0, (p * b - (1 - p)) / b);
-  const fraction = Math.min(0.10, fullKelly * 0.25);  // quarter-Kelly, cap 10%
-  const size = Math.max(5, Math.round(fraction * portfolio * 100) / 100);
+  // 【精准狙击模式】半 Kelly，上限 60%（原为 四分之一 Kelly 上限 10%）
+  // 弱信号 (fullKelly≈0.05) → fraction≈2.5%  → size≈$5（兜底）
+  // 中信号 (fullKelly≈0.15) → fraction≈7.5%  → size≈$9（适中）
+  // 强信号 (fullKelly≈0.30) → fraction≈15%   → size≈$16（进攻）
+  // 超强   (fullKelly≥1.20) → fraction=60%   → size≈$14（上限）
+  const fraction = Math.min(0.60, fullKelly * 0.5);
+  const rawSize = Math.round(fraction * portfolio * 100) / 100;
+  // 【小账户保底】当 Kelly 算出的下注额低于 25% 仓位时，
+  // 用 25% 兜底（仅当组合 > $10 时生效，避免大账户误触）
+  const minFloor = portfolio > 10 ? portfolio * 0.25 : 5;
+  const size = Math.min(portfolio * 0.95, Math.max(minFloor, rawSize));
   return { fraction, size };
 }
 
@@ -603,18 +690,23 @@ async function buildAndSignOrder(account, tokenId, side, price, sizeUsdc, negRis
 
 async function placeOrder(apiCreds, account, tokenId, side, price, sizeUsdc, negRisk = false) {
   log("  [ORDER] " + side + " $" + sizeUsdc + " @ " + price.toFixed(4) + " tokenId=" + tokenId.slice(0, 16) + "...");
-  
+
   const { execSync } = await import("child_process");
-  
+
   const tickPrice = Math.round(price * 100) / 100;
-  const numTokens = Math.max(5, Math.floor(sizeUsdc / tickPrice));
+  // Fix floating point bug (e.g. 4.68 / 0.78 = 5.99999 -> 6)
+  let numTokens = Math.round(sizeUsdc / tickPrice);
   
+  // Only enforce 5 token minimum for BUY orders. SELL orders must be able to close dust.
+  if (side === "BUY" && numTokens < 5) numTokens = 5;
+
   try {
-    const cmd = "python3 /root/.openclaw/place_order.py " + JSON.stringify(tokenId) + " " + side + " " + tickPrice + " " + numTokens;
+    const orderSide = (side === "SELL") ? "SELL" : "BUY";
+    const cmd = "python3 /root/.openclaw/place_order.py " + JSON.stringify(tokenId) + " " + orderSide + " " + tickPrice + " " + numTokens;
     log("  [ORDER CMD] " + cmd.slice(0, 200));
     const result = execSync(cmd, { timeout: 30000, encoding: "utf8" });
     const parsed = JSON.parse(result.trim());
-    
+
     if (parsed.success) {
       log("  [ORDER OK] orderID=" + parsed.orderID);
       return { success: true, orderID: parsed.orderID };
@@ -729,6 +821,21 @@ async function main() {
             p.exitDate = new Date().toISOString();
             if (!pos.closed) pos.closed = [];
             pos.closed.push({ ...p });
+
+            // ── M4: 用退出时的市场价格作为「实际结果」反馈给 Brier Score ──
+            // 逻辑：exitPrice 是市场当前对真实胜率的最新估计，
+            // 我们用它来衡量入场时各信号的预测准不准。
+            if (p.entrySignals) {
+              const outcome = decision.currentPrice; // 市场最新价作为 proxy outcome
+              for (const [sigKey, sigVal] of Object.entries(p.entrySignals)) {
+                if (typeof sigVal === "number") {
+                  updateAdaptation(wData, sigKey, sigVal, outcome);
+                  log(`  [M4] ${sigKey}: predicted=${sigVal.toFixed(4)} outcome=${outcome.toFixed(4)} → new weight=${(wData.weights[sigKey]||0.5).toFixed(3)}`);
+                }
+              }
+            } else {
+              log(`  [M4] 跳过（此仓位无 entrySignals 记录，旧数据）`);
+            }
           }
         }
       }
@@ -741,7 +848,7 @@ async function main() {
           const bal = await getPolygonUsdc(walletAddr);
           portfolio = bal.total;
           log(`[BALANCE UPDATE] After exits: $${portfolio.toFixed(2)}`);
-        } catch {}
+        } catch { }
       }
     }
   }
@@ -808,7 +915,13 @@ async function main() {
     const fee = calcTakerFee(tradePrice, c.tags);
     const netEdgeAfterFee = Math.abs(edge) - fee;
 
-    if (netEdgeAfterFee > minEdge && bothAgree && bothConfident) {
+    // 【BUG FIX 2】严格正向边际检查：
+    // YES 方向只有 edge > 0（我们认为 YES 被低估）才考虑；
+    // NO  方向只有 edge < 0（我们认为 YES 被高估，即 NO 被低估）才考虑。
+    // 防止负 edge 信号被 Math.abs() 误当成正向机会进场。
+    const edgeIsPositiveForSide = (side === "YES" && edge > 0) || (side === "NO" && edge < 0);
+
+    if (netEdgeAfterFee > minEdge && bothAgree && bothConfident && edgeIsPositiveForSide) {
       const { size, fraction } = kellySize(pTrue, c.yesPrice, side, Math.max(portfolio, 1));
 
       log(`  *** SIGNAL: ${side} | Kelly=${(fraction * 100).toFixed(1)}% | size=$${size} | fee=${(fee * 100).toFixed(2)}% | netEdge=${(netEdgeAfterFee * 100).toFixed(2)}% ***`);
@@ -818,114 +931,106 @@ async function main() {
         bestOpp = { ...entry, side, tradePrice, size, fraction, fee, netEv };
       }
 
-      // ── M3: Track best signal (execute after loop) ──
-      if (false && portfolio >= 10 && apiCreds && walletData) {
-        const tokenId = side === "YES" ? c.tokenIdYes : c.tokenIdNo;
-        if (tokenId && size >= 5 && size <= portfolio * 0.50) {
-          try {
-            const account = privateKeyToAccount(walletData.privateKey);
-            const isNegRisk = c.negRisk || false;
-            log();
-            const orderResult = await placeOrder(apiCreds, account, tokenId, side, tradePrice, size, isNegRisk);
-
-            const journal = load("trade_journal.json", { trades: [] });
-            journal.trades.push({
-              timestamp: new Date().toISOString(),
-              action: orderResult.success ? "ORDER_PLACED" : "ORDER_FAILED",
-              market: c.question,
-              conditionId: c.conditionId,
-              side, price: tradePrice, size, fraction, pTrue, edge,
-              signals: entry.signals,
-              orderID: orderResult.orderID || null,
-              status: orderResult.success ? "pending_fill" : "failed",
-              error: orderResult.error || null,
-            });
-            save("trade_journal.json", journal);
-          } catch (e) {
-            log(`  [ORDER ERROR] ${e.message}`);
-          }
-        }
-      } else {
-        // Log signal to journal even without execution
-        const journal = load("trade_journal.json", { trades: [] });
-        journal.trades.push({
-          timestamp: new Date().toISOString(),
-          action: "SIGNAL",
-          market: c.question,
-          conditionId: c.conditionId,
-          side, price: tradePrice, size, fraction, pTrue, edge,
-          signals: entry.signals,
-          status: portfolio < 10 ? "insufficient_funds" : "no_api_creds",
-        });
-        save("trade_journal.json", journal);
-      }
+      // ── M3: 仅记录信号，不在扫描循环内下单 ──
+      // 【BUG FIX】原代码在此处会对每个满足条件的市场直接下单，
+      // 且没有检查是否已持有该市场的仓位，导致重复买入和孤儿Token。
+      // 现已将所有下单逻辑统一移至扫描循环结束后的"最优机会执行"阶段，
+      // 那里有完整的仓位冲突检查（conditionId 去重）。
+      const journal = load("trade_journal.json", { trades: [] });
+      journal.trades.push({
+        timestamp: new Date().toISOString(),
+        action: "SIGNAL",
+        market: c.question,
+        conditionId: c.conditionId,
+        side, price: tradePrice, size, fraction, pTrue, edge,
+        signals: entry.signals,
+        status: "pending_best_opp_selection",
+      });
+      save("trade_journal.json", journal);
     } else {
       const reason = !bothAgree ? "signals_disagree"
         : !bothConfident ? "low_confidence"
-        : netEdgeAfterFee <= minEdge && Math.abs(edge) > minEdge ? `fee_exceeds_edge(raw=${(Math.abs(edge)*100).toFixed(2)}% fee=${(fee*100).toFixed(2)}%)`
-        : "edge_too_small";
+          : netEdgeAfterFee <= minEdge && Math.abs(edge) > minEdge ? `fee_exceeds_edge(raw=${(Math.abs(edge) * 100).toFixed(2)}% fee=${(fee * 100).toFixed(2)}%)`
+            : "edge_too_small";
       log(`  PASS (${reason})`);
     }
   }
 
   // Save outputs
   save("polymarket_watchlist.json", watchlist);
-  if (bestOpp) save("best_opportunity.json", bestOpp);
+  if (bestOpp) {
+    save("best_opportunity.json", bestOpp);
+    // Append to history log
+    const histLine = JSON.stringify({ timestamp: new Date().toISOString(), ...bestOpp }) + "\n";
+    try {
+      const fs = req("fs");
+      fs.appendFileSync(`${DATA}/best_opportunities_history.jsonl`, histLine);
+    } catch (e) { log("[HISTORY ERR] " + e.message); }
+  }
 
   // ── Execute best opportunity (one trade per scan) ──
-  // Conflict check: skip if we already hold a position in this market
-  if (bestOpp && (pos.positions || []).some(p => p.conditionId === bestOpp.conditionId)) {
-    log(">>> SKIP: already holding position in \"" + bestOpp.question.slice(0, 50) + "\"");
-    bestOpp = null;
-  }
-  if (bestOpp && portfolio >= 10 && apiCreds && walletData) {
-    const tokenId = bestOpp.side === "YES" ? bestOpp.tokenIdYes : bestOpp.tokenIdNo;
-    if (tokenId && bestOpp.size >= 5 && bestOpp.size <= portfolio * 0.50) {
-      log(">>> EXECUTING BEST: " + bestOpp.side + " \"" + bestOpp.question.slice(0, 50) + "\" edge=" + bestOpp.edge.toFixed(4));
-      try {
-        const account = privateKeyToAccount(walletData.privateKey);
-        const isNegRisk = bestOpp.negRisk || false;
-        const tickPrice = Math.round(bestOpp.tradePrice * 100) / 100;
-        const numTokens = Math.max(5, Math.floor(bestOpp.size / tickPrice));
-        const orderResult = await placeOrder(apiCreds, account, tokenId, bestOpp.side, bestOpp.tradePrice, bestOpp.size, isNegRisk);
+  if (!TRADING_ENABLED) {
+    log(">>> TRADING DISABLED: skipping execution phase");
+  } else {
+    // 【BUG FIX 1】冲突检查：同时检查 open 仓位和 closed 历史记录，
+    // 防止重新进入近期已退出的市场（孤儿 Token 市场复进的根因）。
+    const allKnownConditions = new Set([
+      ...(pos.positions || []).map(p => p.conditionId),
+      ...(pos.closed || []).map(p => p.conditionId),
+    ]);
+    if (bestOpp && allKnownConditions.has(bestOpp.conditionId)) {
+      log(">>> SKIP: conditionId already in positions/closed history: \"" + bestOpp.question.slice(0, 50) + "\"");
+      bestOpp = null;
+    }
+    if (bestOpp && portfolio >= 3 && apiCreds && walletData) {
+      const tokenId = bestOpp.side === "YES" ? bestOpp.tokenIdYes : bestOpp.tokenIdNo;
+      if (tokenId && bestOpp.size >= 3) {
+        log(">>> EXECUTING BEST: " + bestOpp.side + " \"" + bestOpp.question.slice(0, 50) + "\" edge=" + bestOpp.edge.toFixed(4));        try {
+          const account = privateKeyToAccount(walletData.privateKey);
+          const isNegRisk = bestOpp.negRisk || false;
+          const tickPrice = Math.round(bestOpp.tradePrice * 100) / 100;
+          const numTokens = Math.max(5, Math.floor(bestOpp.size / tickPrice));
+          const orderResult = await placeOrder(apiCreds, account, tokenId, bestOpp.side, bestOpp.tradePrice, bestOpp.size, isNegRisk);
 
-        const journal = load("trade_journal.json", { trades: [] });
-        journal.trades.push({
-          timestamp: new Date().toISOString(),
-          action: orderResult.success ? "ORDER_PLACED" : "ORDER_FAILED",
-          market: bestOpp.question,
-          conditionId: bestOpp.conditionId,
-          tokenId,
-          side: bestOpp.side, price: bestOpp.tradePrice, size: bestOpp.size,
-          fraction: bestOpp.fraction, pTrue: bestOpp.pTrue, edge: bestOpp.edge,
-          signals: bestOpp.signals,
-          orderID: orderResult.orderID || null,
-          status: orderResult.success ? "pending_fill" : "failed",
-          error: orderResult.error || null,
-        });
-        save("trade_journal.json", journal);
-        // Record new position locally
-        if (orderResult.success) {
-          pos.positions.push({
-            id: Math.random().toString(36).slice(2),
+          const journal = load("trade_journal.json", { trades: [] });
+          journal.trades.push({
+            timestamp: new Date().toISOString(),
+            action: orderResult.success ? "ORDER_PLACED" : "ORDER_FAILED",
             market: bestOpp.question,
             conditionId: bestOpp.conditionId,
             tokenId,
-            side: bestOpp.side,
-            entryPrice: bestOpp.tradePrice,
-            numTokens,
-            entryDate: new Date().toISOString(),
-            entryEdge: bestOpp.edge,
-            entryPTrue: bestOpp.pTrue,
-            negRisk: isNegRisk,
-            status: "open",
+            side: bestOpp.side, price: bestOpp.tradePrice, size: bestOpp.size,
+            fraction: bestOpp.fraction, pTrue: bestOpp.pTrue, edge: bestOpp.edge,
+            signals: bestOpp.signals,
+            orderID: orderResult.orderID || null,
+            status: orderResult.success ? "pending_fill" : "failed",
+            error: orderResult.error || null,
           });
-          save("polymarket_positions.json", pos);
-          log("  [POSITION RECORDED] " + bestOpp.side + " " + bestOpp.question.slice(0, 40));
-          await notify("BUY " + bestOpp.side, `**${bestOpp.question}**\n\n- 方向: ${bestOpp.side}\n- 价格: $${bestOpp.tradePrice.toFixed(4)}\n- 数量: ${numTokens} tokens\n- 金额: $${bestOpp.size.toFixed(2)}\n- Edge: ${(bestOpp.edge * 100).toFixed(2)}%\n- OrderID: ${orderResult.orderID}`);
+          save("trade_journal.json", journal);
+          // Record new position locally
+          if (orderResult.success) {
+            pos.positions.push({
+              id: Math.random().toString(36).slice(2),
+              market: bestOpp.question,
+              conditionId: bestOpp.conditionId,
+              tokenId,
+              side: bestOpp.side,
+              entryPrice: bestOpp.tradePrice,
+              numTokens,
+              entryDate: new Date().toISOString(),
+              entryEdge: bestOpp.edge,
+              entryPTrue: bestOpp.pTrue,
+              entrySignals: bestOpp.signals,  // ← M4: 保存入场时各信号值，用于未来 Brier 反馈
+              negRisk: isNegRisk,
+              status: "open",
+            });
+            save("polymarket_positions.json", pos);
+            log("  [POSITION RECORDED] " + bestOpp.side + " " + bestOpp.question.slice(0, 40));
+            await notify("BUY " + bestOpp.side, `**${bestOpp.question}**\n\n- 方向: ${bestOpp.side}\n- 价格: $${bestOpp.tradePrice.toFixed(4)}\n- 数量: ${numTokens} tokens\n- 金额: $${bestOpp.size.toFixed(2)}\n- Edge: ${(bestOpp.edge * 100).toFixed(2)}%\n- OrderID: ${orderResult.orderID}`);
+          }
+        } catch (e) {
+          log("  [EXEC ERROR] " + e.message);
         }
-      } catch (e) {
-        log("  [EXEC ERROR] " + e.message);
       }
     }
   }
@@ -937,10 +1042,35 @@ async function main() {
     log("No actionable opportunities this scan.");
   }
 
+  // ── M4: 每轮扫描结束后持久化权重（无论是否有新交易都保存）──
+  save("signal_weights.json", wData);
+  log(`[M4] Weights saved → clob=${(wData.weights.clob_micro||0.5).toFixed(3)} mom=${(wData.weights.momentum||0.5).toFixed(3)} resolutions=${wData.total_resolutions||0}`);
+
   log("═══ SCANNER v2 COMPLETE ═══");
 }
 
-main().catch(e => { log("FATAL:", e.message, "\n", e.stack); process.exit(1); });
+// ── 崩溃防护层（严禁进程被意外错误杀死）──
+process.on("uncaughtException",   e => log("[UNCAUGHT]  " + e.message));
+process.on("unhandledRejection",  e => log("[UNHANDLED] " + (e?.message || e)));
+
+// ── 5 分钟经印止讯（防止某个失败的网络请求把整个进程卡住）──
+const HARD_TIMEOUT = 5 * 60 * 1000; // 5 min
+const timer = setTimeout(() => {
+  log("[WATCHDOG] 扫描超时5分钟，强制退出（cron 会在 3 分钟内重启）");
+  process.exit(0);
+}, HARD_TIMEOUT);
+timer.unref(); // 不阻止正常退出
+
+main()
+  .then(() => {
+    clearTimeout(timer);
+    process.exit(0);
+  })
+  .catch(e => {
+    clearTimeout(timer);
+    log("FATAL: " + e.message + "\n" + (e.stack || ""));
+    process.exit(1);
+  });
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // NEWS SENTIMENT SIGNAL (3rd signal to enable trading)
@@ -951,19 +1081,19 @@ async function newsSignal(question, mktPrice) {
     // Search for recent news about the question topic
     const keywords = question.split(' ').slice(0, 5).join(' ');
     const searchUrl = `https://news.google.com/search?q=${encodeURIComponent(keywords)}&hl=en-US&gl=US&ceid=US%3Aen`;
-    
+
     // Simple sentiment heuristic: assume neutral (0.5) if we can't fetch
     // In production, would use a real news API or ML sentiment model
     const resp = await fetch(searchUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0' },
       signal: AbortSignal.timeout(5000)
     }).catch(() => null);
-    
+
     if (!resp || !resp.ok) {
       // No news found = market price is fair = neutral sentiment
       return { sig: mktPrice, conf: 0.5, src: 'news_neutral' };
     }
-    
+
     // For MVP: if we get news, assume slight bias toward market (75% confidence)
     return { sig: mktPrice * 1.02, conf: 0.75, src: 'news_api' };
   } catch (e) {

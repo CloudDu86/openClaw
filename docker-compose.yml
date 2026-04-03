@@ -24,10 +24,10 @@ services:
 
     # ── Volume 挂载 ──
     volumes:
-      # 数据目录: 钱包、API Key、交易日志、place_order.py
+      # 数据目录: 钱包、API Key、交易日志、place_order.py 等所有运行时文件
       - ./data:/root/.openclaw
-      # 扫描器脚本 (只读挂载，方便宿主机编辑后即时生效)
       - ./market_scanner.mjs:/app/market_scanner.mjs:ro
+      - ./daily_report.mjs:/app/daily_report.mjs:ro
 
     # ── 日志限制 ──
     logging:
