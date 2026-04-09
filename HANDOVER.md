@@ -1,5 +1,12 @@
 # OpenClaw 项目交接文档 (HANDOVER)
 
+## 零、 代码仓库 (Repository)
+- **GitHub**: https://github.com/CloudDu86/openClaw
+- **Remote name**: `openclaw`
+- **推送命令**: `git push openclaw main`
+
+---
+
 ## 一、 项目概览与目标 (Project Overview & Objectives)
 OpenClaw 是一个基于 Node.js/Python 和 Polymarket 预测市场的自动化套利/预测交易扫描器。其目标是通过量化算法全自动运作，从识别高频流动性市场机会，一直到执行下单操作，并随着时间自动对信号准确度进行学习进化。
 
@@ -58,7 +65,11 @@ c:\Users\kanun\openclaw\
 4. **致命的 FATAL Timeout 防护**: 鉴于国内节点直连 Polygon/Polymarket 常发超时，在代码顶段植入了 5 分钟的 watchdog 断头台定时器和 `uncaughtException` 保底函数，超时即自尽交由底端系统 3 分钟后重启，解决无限阻塞死锁。
 5. **小资金测试调优**: 凯利计算增加了针对较小账户的 `%` 托底算法。资金在 10-25U 区间内可以确保发出有效大小(`$5`)符合平台底线的真实交易单。
 6. **早报发送功能激活**: 于 `daily_report.mjs` 集成了 ServerChan 接口与时区自适应 Cron，用户每日正常获取账户监控摘要。
+7. **扫描打击面成倍扩张**: 通过将 Gamma API 获取 limit 从 100 提升至 300，并优化过滤逻辑，使得 Watchlist 高质量有效市场从 10 个提升至 30-50 个。
+8. **精准费率建模 (Bell Curve)**: 引入了基于价格分布的动态 Taker 费率模拟，确保 `netEdge` 计算扣除了所有摩擦成本，防止在低利润空间盲目下单。
+9. **价格边界安全防护**: 修复了平仓时 `currentPrice - 0.01` 可能导致 `price <= 0` 的致命 Bug，现已强制限制最低下单价格为 `$0.01`（平台最小 Tick）。
 
 **下一步行动建议 / 待办梳理 (Next Steps):**
-- 现系统处于小全自动化盈利期，后续需重点审查 `trade_journal.json` 和 `signal_weights.json` 的耦合质量，以便确定 M4 算法引擎权重调度的可靠性。
-- 对未被脚本 `polymarket_positions.json` 捕捉完全的历史“孤单”可以在之后有针对性清除或重整。
+- **Maker-Taker 混合策略迁移**: 目前正在规划从“纯 Taker 狙击”向“Maker 埋伏 + Taker 补刀”混合模式升级。计划首先尝试以 Maker 挂单节省手续费，若 N 分钟未成交则撤单执行 Taker 强平。
+- **孤儿 Token 清理**: 手动清理或通过脚本自动化处理 `polymarket_positions.json` 中未能被同步捕获的历史小额余值。
+- **M4 权重自适应评估**: 继续观察 `signal_weights.json` 的演进，确保 Brier Score 能够根据近期市场波动正确分配 CLOB 与 Momentum 的信任比例。
