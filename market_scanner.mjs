@@ -13,15 +13,27 @@
 
 import { createRequire } from "module";
 import { createHmac, randomBytes } from "crypto";
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 import { homedir } from "os";
 
-const HOME = homedir();
-const DATA = `${HOME}/.openclaw`;
+import { resolve } from "path";
+const DATA = existsSync(resolve(process.cwd(), "data")) ? resolve(process.cwd(), "data") : `${homedir()}/.openclaw`;
 const req = createRequire(import.meta.url);
 
-// Use CJS build of viem (avoids ESM resolution issues in Conway sandbox)
-const { privateKeyToAccount } = req("/app/node_modules/viem/_cjs/accounts/index.js");
+let privateKeyToAccount;
+try {
+  // Docker Sandbox (Conway)
+  privateKeyToAccount = req("/app/node_modules/viem/_cjs/accounts/index.js").privateKeyToAccount;
+} catch (e) {
+  try {
+    // Windows local host
+    const viemAccounts = await import("viem/accounts");
+    privateKeyToAccount = viemAccounts.privateKeyToAccount;
+  } catch (e2) {
+    // Dummy fallback if viem is totally missing
+    privateKeyToAccount = (pk) => ({ address: "0x0000000000000000000000000000000000000000" });
+  }
+}
 
 function load(file, fallback) {
   try { return JSON.parse(readFileSync(`${DATA}/${file}`, "utf8")); }
@@ -92,8 +104,13 @@ const USDC_NATIVE = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";  // Native USD
 
 // ── Exit thresholds: pure thesis invalidation ──
 const EXIT_EDGE_THRESHOLD = -0.02;  // Net Edge < -2pp → thesis invalidated → close
+// ── Time-Decay Exit (P1) ──
+const TIME_DECAY_RATIO     = 0.10;  // patience = 10% of time-to-expiry
+const TIME_DECAY_MIN_HOURS = 4;     // floor: never exit before 4h (short-term arb window)
+const TIME_DECAY_MAX_HOURS = 168;   // cap: never wait more than 7 days
 const MIN_SELL_TOKENS = 5;          // Polymarket minimum order size
 const CTF_TOKEN_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"; // ERC-1155
+const SIMULATE_TRADING = true;      // TRUE = paper trading (no real orders)
 const DRY_RUN_EXITS = false;        // live mode — full auto
 const TRADING_ENABLED = true;       // system will trade automatically when conditions met
 
@@ -259,11 +276,16 @@ async function syncPositions(pos, walletAddr, forceFull = false) {
 
   // ── Step 1: Update existing local positions (Always do this, very fast) ──
   for (const p of positions) {
-    const bal = await readTokenBalance(walletAddr, p.tokenId);
-    if (bal === null) {
-      log(`  [SYNC] "${p.market?.slice(0, 40)}" — RPC read failed, keeping old balance`);
-      continue;
+    let bal = p.numTokens;
+    if (!SIMULATE_TRADING) {
+      const onchainBal = await readTokenBalance(walletAddr, p.tokenId);
+      if (onchainBal === null) {
+        log(`  [SYNC] "${p.market?.slice(0, 40)}" — RPC read failed, keeping old balance`);
+        continue;
+      }
+      bal = onchainBal;
     }
+
     if (bal <= 0.1) {
       log(`  [SYNC] "${p.market?.slice(0, 40)}" — balance=0, closing`);
       p.status = "closed";
@@ -306,9 +328,18 @@ async function syncPositions(pos, walletAddr, forceFull = false) {
     }
   }
 
-  pos.positions = positions.filter(p => p.status === "open");
+  pos.positions = positions.filter(p => p.status !== "closed" && p.status !== "abandoned");
   save("polymarket_positions.json", pos);
-  return pos.positions;
+  return pos.positions.filter(p => p.status === "open"); // evaluatePosition 只评估 open 仓位
+}
+
+// Returns the patience window (hours) proportional to time-to-expiry.
+function calcDecayThreshold(endDate) {
+  if (!endDate) return TIME_DECAY_MAX_HOURS; // no expiry info → max patience
+  const tteHours = (new Date(endDate).getTime() - Date.now()) / 3_600_000;
+  if (tteHours <= 0) return TIME_DECAY_MIN_HOURS; // already expired → min patience
+  const raw = tteHours * TIME_DECAY_RATIO;
+  return Math.max(TIME_DECAY_MIN_HOURS, Math.min(raw, TIME_DECAY_MAX_HOURS));
 }
 
 async function evaluatePosition(position, wData) {
@@ -327,10 +358,8 @@ async function evaluatePosition(position, wData) {
   ]);
   const signals = { clob_micro: clob, momentum: mom };
   const { pTrue: newPTrue, edge: rawEdge } = calcEdge(signals, wData.weights, currentPrice);
-  // Step 3: calculate net edge from position direction
-  // YES position: we want pTrue > price → netEdge = newPTrue - currentPrice
-  // NO position:  we want pTrue < price → netEdge = currentPrice - newPTrue
-  const netEdge = side === "YES" ? (newPTrue - currentPrice) : (currentPrice - newPTrue);
+  // Step 3: calculate net edge (Expectation - Market)
+  const netEdge = newPTrue - currentPrice;
   // Step 4: thesis invalidation check
   if (netEdge < EXIT_EDGE_THRESHOLD) {
     log(`  [EVAL] "${position.market?.slice(0, 40)}" ${side} — THESIS INVALIDATED`);
@@ -342,7 +371,41 @@ async function evaluatePosition(position, wData) {
       signals: { clob_micro: clob.signal, momentum: mom.signal },
     };
   }
-  log(`  [EVAL] "${position.market?.slice(0, 40)}" ${side} — HOLD | netEdge=${netEdge.toFixed(4)} price=${currentPrice.toFixed(3)} pnl=${(pnlPct * 100).toFixed(1)}%`);
+
+  // Step 5: Edge Exhaustion (Profit Taking)
+  // When netEdge < takerFee * 0.5, our mathematical edge is effectively exhausted.
+  // Since we prefer Maker sell orders (0 fee), we don't strictly require full takerFee coverage to exit.
+  const takerFee = calcTakerFee(currentPrice, position.tags || []);
+  const exhaustionThreshold = Math.max(takerFee, 0.005) * 0.5; // floor 0.5% for 0-fee categories (e.g. geopolitics)
+  if (netEdge < exhaustionThreshold && pnlPct > 0) {
+    log(`  [EVAL] "${position.market?.slice(0, 40)}" ${side} — EDGE EXHAUSTED (PROFIT TAKING)`);
+    log(`    netEdge=${netEdge.toFixed(4)} < limit(${exhaustionThreshold.toFixed(4)}) | price=${currentPrice.toFixed(3)} pTrue=${newPTrue.toFixed(4)} pnl=${(pnlPct * 100).toFixed(1)}%`);
+    return {
+      action: "EXIT", reason: "edge_exhaustion",
+      currentPrice, newPTrue, netEdge, pnlPct,
+      signals: { clob_micro: clob.signal, momentum: mom.signal },
+    };
+  }
+  // Step 6: Time-Decay Exit
+  // Trigger only when ALL three are true:
+  //   (1) held longer than the dynamic patience window
+  //   (2) position is not profitable (price hasn't moved in our favour)
+  //   (3) underlying thesis has weakened (netEdge decayed, not just consumed by PnL)
+  const holdHours = (Date.now() - new Date(position.entryDate).getTime()) / 3_600_000;
+  const decayThreshold = calcDecayThreshold(position.endDate);
+  const isTimeDecayed    = holdHours > decayThreshold;
+  const isNotProfitable  = pnlPct <= 0;
+  const isThesisWeakened = netEdge < (position.entryEdge || 0) - 0.005;
+  if (isTimeDecayed && isNotProfitable && isThesisWeakened) {
+    log(`  [EVAL] "${position.market?.slice(0, 40)}" ${side} — TIME DECAY EXIT`);
+    log(`    held=${holdHours.toFixed(1)}h > threshold=${decayThreshold.toFixed(1)}h | pnl=${(pnlPct * 100).toFixed(1)}% | netEdge=${netEdge.toFixed(4)} entryEdge=${(position.entryEdge || 0).toFixed(4)}`);
+    return {
+      action: "EXIT", reason: "time_decay",
+      currentPrice, newPTrue, netEdge, pnlPct,
+      signals: { clob_micro: clob.signal, momentum: mom.signal },
+    };
+  }
+  log(`  [EVAL] "${position.market?.slice(0, 40)}" ${side} — HOLD | netEdge=${netEdge.toFixed(4)} price=${currentPrice.toFixed(3)} pnl=${(pnlPct * 100).toFixed(1)}% held=${holdHours.toFixed(1)}h/${decayThreshold.toFixed(1)}h`);
   return {
     action: "HOLD", reason: "thesis_valid",
     currentPrice, newPTrue, netEdge, pnlPct,
@@ -368,45 +431,54 @@ async function executeSell(position, decision, apiCreds, walletData) {
     save("trade_journal.json", journal);
     return { success: false, error: "too_small_to_sell" };
   }
-  // Sell price: one tick below current midpoint for aggressive fill
-  const sellPrice = Math.round((currentPrice - 0.01) * 100) / 100;
+  // --- MAKER / TAKER PRICING ---
+  // Maker sell at midpoint to test market. If 0.99, limit it.
+  const makerPrice = Math.max(0.01, Math.min(0.99, Math.round((currentPrice) * 100) / 100));
+  // Taker sell fallback limits down to 0.01
+  const takerPrice = Math.max(0.01, Math.min(0.99, Math.round((currentPrice - 0.05) * 100) / 100)); // allow generous slippage on taker
+
   const sellTokens = Math.floor(numTokens);
+  
   if (DRY_RUN_EXITS) {
-    log(`  [DRY-RUN SELL] "${position.market?.slice(0, 40)}" SELL ${sellTokens} tokens @ ${sellPrice.toFixed(2)} reason=${reason}`);
+    log(`  [DRY-RUN SELL] "${position.market?.slice(0, 40)}" SELL ${sellTokens} tokens @ ${makerPrice.toFixed(2)} reason=${reason}`);
     const journal = load("trade_journal.json", { trades: [] });
     journal.trades.push({
       timestamp: new Date().toISOString(),
       action: "SELL_DRY_RUN",
       market: position.market, conditionId: position.conditionId,
       tokenId, side, numTokens: sellTokens,
-      entryPrice: position.entryPrice, exitPrice: sellPrice,
+      entryPrice: position.entryPrice, exitPrice: makerPrice,
       exitReason: reason, netEdge, pnlPct,
       signalsAtExit: decision.signals,
     });
     save("trade_journal.json", journal);
     return { success: true, dryRun: true };
   }
-  // Real sell order via Python bridge
-  log(`  [SELL] "${position.market?.slice(0, 40)}" SELL ${sellTokens} @ ${sellPrice.toFixed(2)}`);
-  const orderResult = await placeOrder(apiCreds, null, tokenId, "SELL", sellPrice, sellTokens * sellPrice, negRisk);
+  
+  log(`  [MAKER SELL] "${position.market?.slice(0, 40)}" SELL ${sellTokens} @ ${makerPrice.toFixed(2)} (Fallback: ${takerPrice})`);
+  const orderResult = await placeOrder(apiCreds, null, tokenId, "SELL", makerPrice, sellTokens * makerPrice, negRisk);
+  
   const journal = load("trade_journal.json", { trades: [] });
   journal.trades.push({
     timestamp: new Date().toISOString(),
-    action: orderResult.success ? "SELL_PLACED" : "SELL_FAILED",
+    action: orderResult.success ? "MAKER_SELL_PLACED" : "SELL_FAILED",
     market: position.market, conditionId: position.conditionId,
     tokenId, side, numTokens: sellTokens,
-    entryPrice: position.entryPrice, exitPrice: sellPrice,
+    entryPrice: position.entryPrice, exitPrice: makerPrice,
     exitReason: reason, netEdge, pnlPct,
     signalsAtExit: decision.signals,
     orderID: orderResult.orderID || null,
     error: orderResult.error || null,
   });
   save("trade_journal.json", journal);
+  
   const pnlStr = (pnlPct * 100).toFixed(1);
   if (orderResult.success) {
-    await notify("SELL " + position.market?.slice(0, 20), `**${position.market}**\n\n- 方向: ${side} → 平仓\n- 入场价: $${position.entryPrice}\n- 卖出价: $${sellPrice.toFixed(2)}\n- 数量: ${sellTokens} tokens\n- PnL: ${pnlStr}%\n- 原因: ${reason}\n- netEdge: ${netEdge.toFixed(4)}`);
+     orderResult.makerPrice = makerPrice;
+     orderResult.takerPrice = takerPrice;
   } else {
-    await notify("SELL FAILED", `**${position.market}**\n\n- 卖出失败: ${orderResult.error}\n- PnL: ${pnlStr}%`);
+    // notify disabled: individual trade alerts suppressed, daily report only
+    // await notify("SELL FAILED", `**${position.market}**\n\n- 卖出失败: ${orderResult.error}\n- PnL: ${pnlStr}%`);
   }
   return orderResult;
 }
@@ -417,7 +489,7 @@ async function executeSell(position, decision, apiCreds, walletData) {
 
 async function scanMarkets() {
   // Use Gamma API (provides real volume, we bypass block with User-Agent)
-  const resp = await fetch(`https://gamma-api.polymarket.com/markets?limit=100&active=true&closed=false&order=volumeNum&ascending=false`, {
+  const resp = await fetch(`https://gamma-api.polymarket.com/markets?limit=300&active=true&closed=false&order=volumeNum&ascending=false`, {
     headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
     signal: AbortSignal.timeout(20000)
   }).then(r => r.json()).catch(() => null);
@@ -586,9 +658,8 @@ function kellySize(pTrue, mktPrice, side, portfolio) {
   // 超强   (fullKelly≥1.20) → fraction=60%   → size≈$14（上限）
   const fraction = Math.min(0.60, fullKelly * 0.5);
   const rawSize = Math.round(fraction * portfolio * 100) / 100;
-  // 【小账户保底】当 Kelly 算出的下注额低于 25% 仓位时，
-  // 用 25% 兜底（仅当组合 > $10 时生效，避免大账户误触）
-  const minFloor = portfolio > 10 ? portfolio * 0.25 : 5;
+  // 【小账户保底】无论如何最低下单限制应满足交易所最低要求 $5
+  const minFloor = 5; 
   const size = Math.min(portfolio * 0.95, Math.max(minFloor, rawSize));
   return { fraction, size };
 }
@@ -691,6 +762,11 @@ async function buildAndSignOrder(account, tokenId, side, price, sizeUsdc, negRis
 async function placeOrder(apiCreds, account, tokenId, side, price, sizeUsdc, negRisk = false) {
   log("  [ORDER] " + side + " $" + sizeUsdc + " @ " + price.toFixed(4) + " tokenId=" + tokenId.slice(0, 16) + "...");
 
+  if (SIMULATE_TRADING) {
+    log("  [ORDER SIMULATED] Paper trading enabled, skipping python invocation.");
+    return { success: true, orderID: "sim_" + Math.random().toString(36).slice(2) };
+  }
+
   const { execSync } = await import("child_process");
 
   const tickPrice = Math.round(price * 100) / 100;
@@ -760,6 +836,161 @@ function updateAdaptation(wData, signalKey, predictedProb, actualOutcome) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// MAKER-TAKER FALLBACK ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Sim-only: check if a Maker order would fill based on real CLOB book depth.
+// isBuy=true  → Maker BUY  @ limitPrice: needs asks ≤ limitPrice with enough size
+// isBuy=false → Maker SELL @ limitPrice: needs bids ≥ limitPrice with enough size
+async function checkMakerFillSim(tokenId, isBuy, limitPrice, requiredTokens) {
+  const book = await fetchJson(`https://clob.polymarket.com/book?token_id=${tokenId}`);
+  if (!book) {
+    log(`    [SIM FILL] book fetch failed, falling back to random`);
+    return Math.random() > 0.5 ? "FILLED" : "LIVE";
+  }
+  let availableSize = 0;
+  if (isBuy) {
+    for (const ask of (book.asks || [])) {
+      if (parseFloat(ask.price) <= limitPrice) availableSize += parseFloat(ask.size || 0);
+    }
+  } else {
+    for (const bid of (book.bids || [])) {
+      if (parseFloat(bid.price) >= limitPrice) availableSize += parseFloat(bid.size || 0);
+    }
+  }
+  const filled = availableSize >= requiredTokens;
+  log(`    [SIM FILL] ${isBuy ? "BUY" : "SELL"} @ ${limitPrice} | need=${requiredTokens.toFixed(1)} avail=${availableSize.toFixed(1)} → ${filled ? "FILLED" : "LIVE"}`);
+  return filled ? "FILLED" : "LIVE";
+}
+
+async function checkOrder(orderID) {
+  if (SIMULATE_TRADING) {
+    // Sim path is handled per-position in processPendingOrders via checkMakerFillSim
+    return { success: true, status: "LIVE", size_matched: 0 };
+  }
+  try {
+    const { execSync } = await import("child_process");
+    const cmd = `python3 /root/.openclaw/get_order.py "${orderID}"`;
+    const result = execSync(cmd, { timeout: 15000, encoding: "utf8" });
+    return JSON.parse(result.trim());
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+async function cancelOrder(orderID) {
+  if (SIMULATE_TRADING) return { success: true };
+  try {
+    const { execSync } = await import("child_process");
+    const cmd = `python3 /root/.openclaw/cancel_order.py "${orderID}"`;
+    const result = execSync(cmd, { timeout: 15000, encoding: "utf8" });
+    return JSON.parse(result.trim());
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+async function processPendingOrders(pos, apiCreds) {
+  const pending = (pos.positions || []).filter(p => ["pending_maker_buy", "pending_maker_sell"].includes(p.status));
+  if (pending.length === 0) return;
+  
+  log(`[MAKER ENGINE] Processing ${pending.length} pending maker orders...`);
+  let changed = false;
+
+  for (const p of pending) {
+    log(`  [CHECK] orderID=${p.orderID} for ${p.market?.slice(0,40)}`);
+    let fillStatus;
+    if (SIMULATE_TRADING) {
+      const isBuy = p.status === "pending_maker_buy";
+      const limitPrice = isBuy ? p.entryPrice : p.exitPriceMaker;
+      const requiredTokens = isBuy ? p.numTokens : Math.floor(p.numTokens);
+      if (limitPrice && requiredTokens) {
+        fillStatus = await checkMakerFillSim(p.tokenId, isBuy, limitPrice, requiredTokens);
+      } else {
+        fillStatus = "LIVE"; // missing price/size info → treat as unfilled
+      }
+    } else {
+      const check = await checkOrder(p.orderID);
+      if (!check.success) {
+        log(`    -> query failed: ${check.error}`);
+        continue;
+      }
+      fillStatus = check.status;
+    }
+    
+    if (fillStatus === "FILLED" || fillStatus === "CANCELED" || fillStatus === "EXPIRED") {
+      changed = true;
+      if (fillStatus === "FILLED") {
+         log(`    -> FILLED! 0% Maker fee secured.`);
+         if (p.status === "pending_maker_buy") p.status = "open";
+         else if (p.status === "pending_maker_sell") {
+            p.status = "closed";
+            pos.closed = pos.closed || [];
+            pos.closed.push({...p});
+            if (SIMULATE_TRADING) pos.portfolio_usdc = (pos.portfolio_usdc || 0) + (Math.floor(p.numTokens) * p.exitPriceMaker);
+            // await notify("MAKER SELL FILLED", `**${p.market}**\n\n- 卖单以 Maker (${p.exitPriceMaker}) 成功填单！`);
+         }
+      } else {
+         log(`    -> ${fillStatus}. Order removed externally.`);
+         if (p.status === "pending_maker_buy") {
+             if (SIMULATE_TRADING) pos.portfolio_usdc = (pos.portfolio_usdc || 0) + p.entrySizeUsdc; // refund SIM money
+             p.status = "abandoned";
+         } else {
+             p.status = "open"; // back to holding, maybe try again
+         }
+      }
+    } else if (fillStatus === "LIVE") {
+      changed = true;
+      log(`    -> LIVE after 3 mins. Canceling to fallback to TAKER...`);
+      await cancelOrder(p.orderID);
+      
+      const takerParams = p.takerParams || {};
+      if (p.status === "pending_maker_buy") {
+         const netEdgeAfterFee = p.entryEdge - (takerParams.fee || 0);
+         const minE = takerParams.minEdge || 0.02;
+         
+         if (netEdgeAfterFee > minE) {
+            const orderResult = await placeOrder(apiCreds, null, p.tokenId, "BUY", takerParams.buyLimit, takerParams.size, p.negRisk);
+            if (orderResult.success) {
+               log(`      [TAKER BUY] limit=${takerParams.buyLimit} -> status=open`);
+               p.status = "open";
+               p.entryPrice = takerParams.buyLimit; // record worst-case entry
+            } else {
+               log(`      [TAKER BUY] Failed. Abandoning.`);
+               if (SIMULATE_TRADING) pos.portfolio_usdc += p.entrySizeUsdc;
+               p.status = "abandoned";
+            }
+         } else {
+            log(`      [TAKER BUY ABORTED] Taker fee degrades netEdge (${(netEdgeAfterFee*100).toFixed(2)}%) <= ${minE*100}%. Abandoning to save fees.`);
+            if (SIMULATE_TRADING) pos.portfolio_usdc += p.entrySizeUsdc; // refund
+            p.status = "abandoned";
+         }
+      } else if (p.status === "pending_maker_sell") {
+         const numTkns = Math.floor(p.numTokens);
+         const orderResult = await placeOrder(apiCreds, null, p.tokenId, "SELL", takerParams.sellPrice, numTkns * takerParams.sellPrice, p.negRisk);
+         if (orderResult.success) {
+            log(`      [TAKER SELL] price=${takerParams.sellPrice} -> status=closed`);
+            p.status = "closed";
+            p.exitPrice = takerParams.sellPrice;
+            pos.closed = pos.closed || [];
+            pos.closed.push({...p});
+            if (SIMULATE_TRADING) pos.portfolio_usdc += (numTkns * p.exitPrice);
+            // await notify("TAKER SELL EXECUTED", `**${p.market}**\n\n- Maker 未命中，已降级为 Taker (${p.exitPrice}) 卖出离场。`);
+         } else {
+            log(`      [TAKER SELL] Failed. Keep holding.`);
+            p.status = "open"; 
+         }
+      }
+    }
+  }
+  
+  if (changed) {
+    pos.positions = pos.positions.filter(p => !["abandoned", "closed"].includes(p.status));
+    save("polymarket_positions.json", pos);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MAIN
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -780,7 +1011,11 @@ async function main() {
   // ── Read real USDC balance from Polygon ──
   let portfolio = 0;
   let walletAddr = null;
-  if (walletData?.privateKey) {
+  
+  if (SIMULATE_TRADING) {
+    portfolio = pos.portfolio_usdc || 30.0;
+    log(`[SIMULATION] Virtual Portfolio: $${portfolio.toFixed(2)}`);
+  } else if (walletData?.privateKey) {
     try {
       const account = privateKeyToAccount(walletData.privateKey);
       walletAddr = account.address;
@@ -797,13 +1032,24 @@ async function main() {
     portfolio = pos.portfolio_usdc || 0;
   }
 
-  log(`Portfolio: $${portfolio.toFixed(2)} | Positions: ${(pos.positions || []).length}/5 | Regime: ${wData.regime}`);
+  const freeCash = pos.portfolio_usdc || 0;
+  const openOnly = (pos.positions || []).filter(p => p.status === "open");
+  const positionsValue = openOnly.reduce((sum, p) => sum + (p.numTokens || 0) * (p.entryPrice || 0), 0);
+  const totalEquity = freeCash + positionsValue;
+  log(`Portfolio: $${totalEquity.toFixed(2)} (Free: $${freeCash.toFixed(2)} + Positions: $${positionsValue.toFixed(2)}) | Open: ${openOnly.length}/8 | Regime: ${wData.regime}`);
   log(`Weights: clob=${(wData.weights.clob_micro || 0).toFixed(2)} mom=${(wData.weights.momentum || 0).toFixed(2)}`);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MAKER-TAKER ENGINE (Runs 1st to resolve stuck orders)
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (walletAddr || SIMULATE_TRADING) {
+    await processPendingOrders(pos, apiCreds);
+  }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // POSITION MANAGER: Sync → Evaluate → Exit (runs BEFORE new entries)
   // ═══════════════════════════════════════════════════════════════════════════
-  if (walletAddr) {
+  if (walletAddr || SIMULATE_TRADING) {
     log("[POSITION MANAGER] Syncing positions...");
     const openPositions = await syncPositions(pos, walletAddr);
     log(`[POSITION MANAGER] ${openPositions.length} open position(s)`);
@@ -815,12 +1061,14 @@ async function main() {
         if (decision.action === "EXIT") {
           const result = await executeSell(p, decision, apiCreds, walletData);
           if (result.success && !result.dryRun) {
-            p.status = "closed";
-            p.exitReason = decision.reason;
-            p.exitPrice = decision.currentPrice;
-            p.exitDate = new Date().toISOString();
-            if (!pos.closed) pos.closed = [];
-            pos.closed.push({ ...p });
+            // Maker Order successfully placed
+            p.status = "pending_maker_sell";
+            p.orderID = result.orderID;
+            p.exitPriceMaker = result.makerPrice;
+            p.takerParams = { sellPrice: result.takerPrice };
+            
+            // Wait 3 mins for resolution
+            save("polymarket_positions.json", pos);
 
             // ── M4: 用退出时的市场价格作为「实际结果」反馈给 Brier Score ──
             // 逻辑：exitPrice 是市场当前对真实胜率的最新估计，
@@ -840,10 +1088,10 @@ async function main() {
         }
       }
       // Update positions after exits
-      pos.positions = openPositions.filter(p => p.status === "open");
+      pos.positions = openPositions.filter(p => p.status !== "closed" && p.status !== "abandoned");
       save("polymarket_positions.json", pos);
-      // Re-read balance after sells
-      if (pos.positions.length < openPositions.length) {
+      // Re-read balance after sells (Only if NOT simulating)
+      if (!SIMULATE_TRADING && pos.positions.length < openPositions.length) {
         try {
           const bal = await getPolygonUsdc(walletAddr);
           portfolio = bal.total;
@@ -854,8 +1102,8 @@ async function main() {
   }
 
   // ── Risk gates ──
-  if ((pos.positions || []).length >= 5) {
-    log("RISK GATE: 5 positions open — no new entries");
+  if ((pos.positions || []).length >= 8) {
+    log("RISK GATE: 8 positions open — no new entries");
     log("═══ SCANNER COMPLETE (risk blocked) ═══");
     return;
   }
@@ -877,9 +1125,18 @@ async function main() {
   const watchlist = { markets: [], updated: new Date().toISOString() };
   let bestOpp = null;
 
+  const allKnownConditions = new Set([
+    ...(pos.positions || []).map(p => p.conditionId), // 只屏蔽当前持仓（open/pending），不屏蔽历史已平仓
+  ]);
+
   for (const c of candidates) {
     log(`\n  Q: ${c.question.slice(0, 80)}`);
     log(`  YES=${c.yesPrice.toFixed(3)} NO=${c.noPrice.toFixed(3)} | Vol=$${(c.volume / 1000).toFixed(0)}k`);
+
+    if (allKnownConditions.has(c.conditionId)) {
+      log("  PASS (already_in_portfolio)");
+      continue;
+    }
 
     // ── M1: Generate signals (only real ones) ──
     const [clob, mom] = await Promise.all([
@@ -893,8 +1150,14 @@ async function main() {
     };
 
     // ── M2: Calculate edge ──
-    const { pTrue, edge, ev, agreeing } = calcEdge(signals, wData.weights, c.yesPrice);
-    log(`  P_true=${pTrue.toFixed(4)} Edge=${edge.toFixed(4)} EV=${ev.toFixed(4)} Agree=${agreeing}/2`);
+    const { pTrue, edge: rawEdgeYes, ev, agreeing } = calcEdge(signals, wData.weights, c.yesPrice);
+    const side = rawEdgeYes > 0 ? "YES" : "NO";
+    const tradePrice = Math.round((side === "YES" ? c.yesPrice : c.noPrice) * 100) / 100;
+    
+    // Calculate edge relative to the side we are taking
+    const edge = side === "YES" ? rawEdgeYes : (c.yesPrice - pTrue); 
+    
+    log(`  P_true(YES)=${pTrue.toFixed(4)} Edge(${side})=${edge.toFixed(4)} EV=${ev.toFixed(4)} Agree=${agreeing}/2`);
     log(`    clob: sig=${clob.signal.toFixed(4)} conf=${clob.confidence.toFixed(2)} depth=${clob.totalDepth?.toFixed(0) || "?"}`);
     log(`    mom:  sig=${mom.signal.toFixed(4)} conf=${mom.confidence.toFixed(2)} pts=${mom.dataPoints || "?"}`);
 
@@ -907,35 +1170,28 @@ async function main() {
     watchlist.markets.push(entry);
 
     // ── M2 Gate (with taker fee) ──
-    const minEdge = wData.regime === "regime_shift" ? 0.03 : 0.02;
+    const minEdge = wData.regime === "regime_shift" ? 0.02 : 0.01;
     const bothAgree = agreeing >= 2;
     const bothConfident = clob.confidence >= 0.3 && mom.confidence >= 0.3;
-    const side = edge > 0 ? "YES" : "NO";
-    const tradePrice = Math.round((side === "YES" ? c.yesPrice : c.noPrice) * 100) / 100;
     const fee = calcTakerFee(tradePrice, c.tags);
-    const netEdgeAfterFee = Math.abs(edge) - fee;
+    // [NEW LOGIC] Maker doesn't pay taker fee
+    const makerEdge = edge;
+    const netEdgeAfterFee = edge - fee;
 
-    // 【BUG FIX 2】严格正向边际检查：
-    // YES 方向只有 edge > 0（我们认为 YES 被低估）才考虑；
-    // NO  方向只有 edge < 0（我们认为 YES 被高估，即 NO 被低估）才考虑。
-    // 防止负 edge 信号被 Math.abs() 误当成正向机会进场。
-    const edgeIsPositiveForSide = (side === "YES" && edge > 0) || (side === "NO" && edge < 0);
-
-    if (netEdgeAfterFee > minEdge && bothAgree && bothConfident && edgeIsPositiveForSide) {
+    const edgeIsPositiveForSide = edge > 0;
+    
+    // Maker order only requires raw edge > minEdge
+    if (makerEdge > minEdge && bothAgree && bothConfident && edgeIsPositiveForSide) {
       const { size, fraction } = kellySize(pTrue, c.yesPrice, side, Math.max(portfolio, 1));
 
-      log(`  *** SIGNAL: ${side} | Kelly=${(fraction * 100).toFixed(1)}% | size=$${size} | fee=${(fee * 100).toFixed(2)}% | netEdge=${(netEdgeAfterFee * 100).toFixed(2)}% ***`);
+      log(`  *** SIGNAL (Maker): ${side} | Kelly=${(fraction * 100).toFixed(1)}% | size=$${size} | makerEdge=${(makerEdge * 100).toFixed(2)}% | takerEdge=${(netEdgeAfterFee * 100).toFixed(2)}% ***`);
 
       const netEv = ev - fee;
-      if (!bestOpp || netEv > (bestOpp.netEv || 0)) {
-        bestOpp = { ...entry, side, tradePrice, size, fraction, fee, netEv };
+      // We rank candidates using raw Make EV (ev), since we will try Maker first
+      if (!bestOpp || ev > (bestOpp.ev || 0)) {
+        bestOpp = { ...entry, side, tradePrice, size, fraction, fee, netEv, ev, minEdge };
       }
 
-      // ── M3: 仅记录信号，不在扫描循环内下单 ──
-      // 【BUG FIX】原代码在此处会对每个满足条件的市场直接下单，
-      // 且没有检查是否已持有该市场的仓位，导致重复买入和孤儿Token。
-      // 现已将所有下单逻辑统一移至扫描循环结束后的"最优机会执行"阶段，
-      // 那里有完整的仓位冲突检查（conditionId 去重）。
       const journal = load("trade_journal.json", { trades: [] });
       journal.trades.push({
         timestamp: new Date().toISOString(),
@@ -972,61 +1228,67 @@ async function main() {
   if (!TRADING_ENABLED) {
     log(">>> TRADING DISABLED: skipping execution phase");
   } else {
-    // 【BUG FIX 1】冲突检查：同时检查 open 仓位和 closed 历史记录，
-    // 防止重新进入近期已退出的市场（孤儿 Token 市场复进的根因）。
-    const allKnownConditions = new Set([
-      ...(pos.positions || []).map(p => p.conditionId),
-      ...(pos.closed || []).map(p => p.conditionId),
-    ]);
-    if (bestOpp && allKnownConditions.has(bestOpp.conditionId)) {
-      log(">>> SKIP: conditionId already in positions/closed history: \"" + bestOpp.question.slice(0, 50) + "\"");
-      bestOpp = null;
-    }
     if (bestOpp && portfolio >= 3 && apiCreds && walletData) {
       const tokenId = bestOpp.side === "YES" ? bestOpp.tokenIdYes : bestOpp.tokenIdNo;
       if (tokenId && bestOpp.size >= 3) {
-        log(">>> EXECUTING BEST: " + bestOpp.side + " \"" + bestOpp.question.slice(0, 50) + "\" edge=" + bestOpp.edge.toFixed(4));        try {
+        log(">>> EXECUTING BEST (Maker): " + bestOpp.side + " \"" + bestOpp.question.slice(0, 50) + "\" edge=" + bestOpp.edge.toFixed(4));
+        
+        try {
           const account = privateKeyToAccount(walletData.privateKey);
           const isNegRisk = bestOpp.negRisk || false;
-          const tickPrice = Math.round(bestOpp.tradePrice * 100) / 100;
-          const numTokens = Math.max(5, Math.floor(bestOpp.size / tickPrice));
-          const orderResult = await placeOrder(apiCreds, account, tokenId, bestOpp.side, bestOpp.tradePrice, bestOpp.size, isNegRisk);
+          
+          // --- MAKER / TAKER BUY PRICING ---
+          const makerBuyLimit = bestOpp.tradePrice; 
+          const takerBuyLimit = 0.99; // Fallback to market execution ceiling
+          const sizeUsdc = bestOpp.size;
 
+          const orderResult = await placeOrder(apiCreds, account, tokenId, "BUY", makerBuyLimit, sizeUsdc, isNegRisk);
+          
           const journal = load("trade_journal.json", { trades: [] });
           journal.trades.push({
             timestamp: new Date().toISOString(),
-            action: orderResult.success ? "ORDER_PLACED" : "ORDER_FAILED",
+            action: orderResult.success ? "MAKER_BUY_PLACED" : "ORDER_FAILED",
             market: bestOpp.question,
             conditionId: bestOpp.conditionId,
             tokenId,
-            side: bestOpp.side, price: bestOpp.tradePrice, size: bestOpp.size,
+            side: bestOpp.side, price: makerBuyLimit, size: sizeUsdc,
             fraction: bestOpp.fraction, pTrue: bestOpp.pTrue, edge: bestOpp.edge,
             signals: bestOpp.signals,
             orderID: orderResult.orderID || null,
-            status: orderResult.success ? "pending_fill" : "failed",
+            status: orderResult.success ? "pending_maker" : "failed",
             error: orderResult.error || null,
           });
           save("trade_journal.json", journal);
-          // Record new position locally
+
+          // Record new pending maker position locally
           if (orderResult.success) {
+            const numTokens = sizeUsdc / makerBuyLimit;
             pos.positions.push({
               id: Math.random().toString(36).slice(2),
               market: bestOpp.question,
               conditionId: bestOpp.conditionId,
               tokenId,
               side: bestOpp.side,
-              entryPrice: bestOpp.tradePrice,
+              entryPrice: makerBuyLimit, 
+              entrySizeUsdc: sizeUsdc,
               numTokens,
               entryDate: new Date().toISOString(),
               entryEdge: bestOpp.edge,
               entryPTrue: bestOpp.pTrue,
-              entrySignals: bestOpp.signals,  // ← M4: 保存入场时各信号值，用于未来 Brier 反馈
+              entrySignals: bestOpp.signals,
               negRisk: isNegRisk,
-              status: "open",
+              status: "pending_maker_buy",
+              orderID: orderResult.orderID,
+              tags: bestOpp.tags || [],
+              endDate: bestOpp.endDate || null,
+              takerParams: { buyLimit: takerBuyLimit, size: sizeUsdc, fee: bestOpp.fee, minEdge: bestOpp.minEdge }
             });
+            pos.portfolio_usdc = (pos.portfolio_usdc || 0) - sizeUsdc;
             save("polymarket_positions.json", pos);
-            log("  [POSITION RECORDED] " + bestOpp.side + " " + bestOpp.question.slice(0, 40));
-            await notify("BUY " + bestOpp.side, `**${bestOpp.question}**\n\n- 方向: ${bestOpp.side}\n- 价格: $${bestOpp.tradePrice.toFixed(4)}\n- 数量: ${numTokens} tokens\n- 金额: $${bestOpp.size.toFixed(2)}\n- Edge: ${(bestOpp.edge * 100).toFixed(2)}%\n- OrderID: ${orderResult.orderID}`);
+            if (SIMULATE_TRADING) log(`  [SIM BALANCE] -$${sizeUsdc.toFixed(2)} -> Total $${pos.portfolio_usdc.toFixed(2)}`);
+            
+            log("  [PENDING MAKER RECORDED] " + bestOpp.side + " " + bestOpp.question.slice(0, 40));
+            // await notify("MAKER BUY " + bestOpp.side, `**${bestOpp.question}**\n\n- 发起 Maker 买入: $${makerBuyLimit.toFixed(4)}\n- 金额: $${sizeUsdc.toFixed(2)}\n- 若3分钟未成交将转 Taker`);
           }
         } catch (e) {
           log("  [EXEC ERROR] " + e.message);
@@ -1046,6 +1308,27 @@ async function main() {
   save("signal_weights.json", wData);
   log(`[M4] Weights saved → clob=${(wData.weights.clob_micro||0.5).toFixed(3)} mom=${(wData.weights.momentum||0.5).toFixed(3)} resolutions=${wData.total_resolutions||0}`);
 
+  const openPos = (pos.positions || []).filter(p => p.status === "open");
+  const pendingPos = (pos.positions || []).filter(p => p.status === "pending_maker_buy" || p.status === "pending_maker_sell");
+  const latestFreeCash = pos.portfolio_usdc ?? portfolio;
+  const latestPosValue = openPos.reduce((sum, p) => sum + (p.numTokens || 0) * (p.entryPrice || 0), 0);
+  const latestTotal = latestFreeCash + latestPosValue;
+  log("─────────────────────────────────────────────");
+  log(`Balance  : $${latestTotal.toFixed(2)} total (Free: $${latestFreeCash.toFixed(2)} + Positions: $${latestPosValue.toFixed(2)})`);
+  log(`Positions: ${openPos.length} open | ${pendingPos.length} pending | ${(pos.closed || []).length} closed all-time`);
+  if (openPos.length > 0) {
+    for (const p of openPos) {
+      const heldH = ((Date.now() - new Date(p.entryDate).getTime()) / 3_600_000).toFixed(1);
+      log(`  [${p.side}] "${p.market.slice(0, 45)}" entry=${p.entryPrice} held=${heldH}h`);
+    }
+  }
+  if (pendingPos.length > 0) {
+    for (const p of pendingPos) {
+      log(`  [${p.status}] "${p.market.slice(0, 45)}"`);
+    }
+  }
+  log(`Regime   : ${wData.regime} | clob_w=${(wData.weights.clob_micro||0.5).toFixed(3)} mom_w=${(wData.weights.momentum||0.5).toFixed(3)}`);
+  log("─────────────────────────────────────────────");
   log("═══ SCANNER v2 COMPLETE ═══");
 }
 
